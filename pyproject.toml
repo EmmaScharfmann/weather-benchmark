@@ -1,0 +1,89 @@
+[project]
+name = "earth2studio-pipeline"
+version = "0.1.0"
+description = "Multi-model Earth2Studio pipeline (Aurora / AIFS / AIFS2 / Atlas) on Arraylake ERA5 data"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+
+dependencies = [
+    "earth2studio>=0.16",   # aifs2 extra doesn't exist before 0.16
+    "torch>=2.10,<2.13",   # keep in the range Astral publishes matching flash-attn wheels for (see [tool.uv.sources] below)
+    "arraylake",
+    "pcodec",         # codec used by the earthmover-public/era5 Arraylake repo
+    "xarray",
+    "zarr>=3.0",
+    "pandas",
+    "numpy",
+    "matplotlib",
+    "cartopy",        # rotating-globe plots
+    "imageio",        # GIF writing
+]
+
+# Pick exactly one (or more) of these per environment, matching whichever
+# model backend(s) you actually run -- each just forwards to earth2studio's
+# own optional extra of the same name. "aifs" covers both aifs and aifs1.1
+# (same checkpoint family, same anemoi-models pin).
+[project.optional-dependencies]
+aurora   = ["earth2studio[aurora]", "torchvision"]   # torchvision listed directly so it's routed to the same CUDA index as torch below
+aifs     = ["earth2studio[aifs]", "flash-attn"]      # flash-attn listed directly so [tool.uv.sources] below actually applies to it; let earth2studio's own extra dictate the anemoi-models/anemoi-inference pins rather than pinning them ourselves
+aifs2    = ["earth2studio[aifs2]", "flash-attn"]
+atlas    = ["earth2studio[atlas]"]
+all-models = [
+    "earth2studio[aurora]",
+    "earth2studio[aifs]",
+    "flash-attn",
+    "earth2studio[atlas]",
+    # aifs2 deliberately excluded: it and aifs pin conflicting anemoi-models
+    # versions (exact numbers depend on your earth2studio release -- check
+    # `uv lock -v 2>&1 | grep anemoi-models` if curious). Sync aifs2 into
+    # its own environment instead (see README).
+]
+notebook = ["ipykernel", "jupyter", "ipython"]
+
+[project.scripts]
+run-forecast = "earth2studio_pipeline.pipeline:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["earth2studio_pipeline"]
+
+# --- uv-specific build config -----------------------------------------
+# earth2studio[aifs]/[aifs2] pull in flash-attn, which PyPI only ships as a
+# SOURCE distribution -- pip/uv would otherwise compile CUDA kernels from
+# scratch, which is exactly what failed earlier (nvcc 12.9 on this box vs.
+# torch's bundled CUDA 13.0). Astral publishes prebuilt flash-attn wheels
+# per CUDA line instead, so route both torch and flash-attn to the SAME
+# CUDA-version index and no compiler is touched at all.
+#
+# Pick the index matching `nvcc --version` (or `nvidia-smi` if no toolkit
+# is installed) -- swap cu129 for cu128/cu126/cu130/etc. if needed. See
+# https://wheels.astral.sh/ for exactly which torch versions each CUDA
+# line has flash-attn wheels for; that's why torch is capped above.
+[tool.uv]
+# aifs and aifs2 pin conflicting earthkit-regrid versions (aifs needs
+# ==0.4.0, aifs2 needs >=0.5.1) and cannot be resolved into the same
+# environment -- see README. all-models pulls in aifs, so it conflicts
+# with aifs2 for the same reason. aurora/atlas have no such conflict and
+# can be combined with aifs freely (e.g. `--extra aifs --extra aurora`).
+conflicts = [
+    [{ extra = "aifs" }, { extra = "aifs2" }],
+    [{ extra = "all-models" }, { extra = "aifs2" }],
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[[tool.uv.index]]
+name = "astral-cu129"
+url = "https://wheels.astral.sh/simple/cu129/"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu129" }
+torchvision = { index = "pytorch-cu129" }
+flash-attn = { index = "astral-cu129" }
