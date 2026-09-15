@@ -80,6 +80,31 @@ SURFACE_ALIASES: dict[str, list[str]] = {
     "z_surface": ["z", "geopotential"],
     "sdor": ["sdor", "standard_deviation_of_orography"],
     "slor": ["slor", "slope_of_sub_gridscale_orography"],
+    # --- added for Aurora 1.5, whose input set is far wider than Aurora 1's
+    # (26 surface variables vs 4). Names below match what the Arraylake ERA5
+    # single-level group actually carries.
+    "tcc": ["tcc", "total_cloud_cover"],
+    "lcc": ["lcc", "low_cloud_cover"],
+    "mcc": ["mcc", "medium_cloud_cover"],
+    "hcc": ["hcc", "high_cloud_cover"],
+    "blh": ["blh", "boundary_layer_height"],
+    "cape": ["cape", "convective_available_potential_energy"],
+    "fg10": ["fg10", "10m_wind_gust_since_previous_post_processing"],
+    "zust": ["zust", "friction_velocity"],
+    "fsr": ["fsr", "forecast_surface_roughness"],
+    "lsp": ["lsp", "large_scale_precipitation"],
+    "sf": ["sf", "snowfall"],
+    "ssr": ["ssr", "surface_net_solar_radiation"],
+    "ssrd": ["ssrd", "surface_solar_radiation_downwards"],
+    "tsr": ["tsr", "top_net_solar_radiation"],
+    "tisr": ["tisr", "toa_incident_solar_radiation"],
+    "fdir": ["fdir", "total_sky_direct_solar_radiation_at_surface"],
+    "slhf": ["slhf", "surface_latent_heat_flux"],
+    "ie": ["ie", "instantaneous_moisture_flux"],
+    "tcw": ["tcw", "total_column_water"],
+    # Sea-ice cover: spelled several ways across ERA5 products. If none
+    # resolve, the repo genuinely lacks it -- see the note in the error.
+    "sic": ["sic", "ci", "siconc", "sea_ice_cover", "sea_ice_area_fraction"],
 }
 PRESSURE_ALIASES: dict[str, list[str]] = {
     "z": ["z", "geopotential"],
@@ -186,7 +211,7 @@ class ArraylakeERA5Source:
         ERA5 'tp' accumulations. Pulls straight from the full (un-sliced)
         single-level dataset since it needs the 5 hours *before* whichever
         timestamp was requested, not just that timestamp itself."""
-        tp_name = _first_match(list(self.single.data_vars), SURFACE_ALIASES["tp"])
+        tp_name = _first_match(_names_incl_coords(self.single), SURFACE_ALIASES["tp"])
         end = pd.Timestamp(target_time)
         hourly_times = pd.date_range(end - pd.Timedelta(hours=5), end, freq="1h")
         logger.debug("  tp06 @ %s <- summing hourly tp %s..%s", end, hourly_times[0], hourly_times[-1])
@@ -207,7 +232,7 @@ class ArraylakeERA5Source:
                 method = getattr(self, DERIVED_SURFACE[v])
                 da = xr.concat([method(t) for t in time], dim="time")
             elif v in SURFACE_ALIASES:
-                name = _first_match(list(self.single.data_vars), SURFACE_ALIASES[v])
+                name = _first_match(_names_incl_coords(self.single), SURFACE_ALIASES[v])
                 logger.debug("  %s -> single/%s", v, name)
                 da = self.single[name].sel(time=time)
             else:
@@ -215,7 +240,7 @@ class ArraylakeERA5Source:
                 for prefix, cands in PRESSURE_ALIASES.items():
                     if v.startswith(prefix) and v[len(prefix):].isdigit():
                         level = int(v[len(prefix):])
-                        name = _first_match(list(self.pl.data_vars), cands)
+                        name = _first_match(_names_incl_coords(self.pl), cands)
                         logger.debug("  %s -> pressure/%s @ %s hPa", v, name, level)
                         da = self.pl[name].sel(time=time, **{self.level_dim: level})
                         matched = True

@@ -27,10 +27,11 @@ from .datasource import ArraylakeERA5Source, open_era5_repo
 logger = logging.getLogger(__name__)
 
 
-def run_pipeline(model: str, init_time: str, n_steps: int, out_zarr: str) -> str:
+def run_pipeline(model: str, init_time: str, n_steps: int, out_zarr: str,
+                 n_members: int | None = None) -> str:
     single, pl = open_era5_repo()
     data_source = ArraylakeERA5Source(single, pl)
-    backend = get_backend(model)
+    backend = get_backend(model, n_members=n_members)
     backend.run(data_source, init_time, n_steps, out_zarr)
     return out_zarr
 
@@ -46,10 +47,15 @@ def main() -> None:
     )
     parser.add_argument(
         "--model", required=True,
-        choices=["aurora", "atlas", "aifs1.0", "aifs1.1", "aifs-ens1.0"],
+        choices=["aurora", "aurora1.5", "aurora1.5-ens", "atlas", "aifs1.0", "aifs1.1", "aifs-ens1.0"],
     )
     parser.add_argument("--init-time", required=True, help="e.g. 2026-03-13T00:00:00")
     parser.add_argument("--n-steps", type=int, required=True)
+    parser.add_argument(
+        "--n-members", type=int, default=None,
+        help="Ensemble members (anemoi ensemble checkpoints only). Each "
+             "member is a fresh stochastic draw from the same initial state.",
+    )
     parser.add_argument(
         "--out", default=None, help="Output zarr path (default: outputs/<model>_forecast.zarr)"
     )
@@ -57,7 +63,7 @@ def main() -> None:
 
     out_zarr = args.out or f"outputs/{args.model}_forecast.zarr"
     logger.info("Starting pipeline: model=%s init_time=%s n_steps=%d", args.model, args.init_time, args.n_steps)
-    run_pipeline(args.model, args.init_time, args.n_steps, out_zarr)
+    run_pipeline(args.model, args.init_time, args.n_steps, out_zarr, args.n_members)
     logger.info("Done. Forecast written to %s", out_zarr)
 
 

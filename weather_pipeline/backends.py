@@ -15,6 +15,7 @@ running (e.g. `pip install earth2studio[aurora]`).
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from dataclasses import dataclass
 from typing import Callable
@@ -73,6 +74,87 @@ def _aurora_backend() -> ModelBackend:
     return ModelBackend("aurora", Aurora.load_default_package, Aurora.load_model)
 
 
+@dataclass
+class StochasticModelBackend(ModelBackend):
+    """An Earth2Studio model whose forward pass is stochastic, run N times
+    to build an ensemble.
+
+    Aurora 1.5's ensemble checkpoint injects fresh Gaussian noise into the
+    backbone conditioning on every forward pass, so repeated calls from the
+    SAME initial condition give statistically independent members -- the
+    same mechanism as the AIFS ensemble checkpoint, and it likewise needs
+    no perturbed ICs.
+
+    The model is loaded ONCE and reused across members: it is a ~48 GB
+    checkpoint, so reloading per member would dominate runtime.
+
+    Members are run into separate zarr stores and then combined, because
+    Earth2Studio's `deterministic` runner owns its output store and has no
+    member concept. The intermediates are removed afterwards."""
+
+    n_members: int = 1
+
+    def run(
+        self,
+        data_source: ArraylakeERA5Source,
+        init_time: str,
+        n_steps: int,
+        out_zarr: str,
+        device: str | None = None,
+    ) -> str:
+        import shutil
+        from pathlib import Path
+
+        import xarray as xr
+        from earth2studio.io import ZarrBackend
+        from earth2studio.run import deterministic as run_deterministic
+
+        if self.n_members == 1:
+            return super().run(data_source, init_time, n_steps, out_zarr, device)
+
+        model = self.load(device)
+        tmp_dir = Path(out_zarr).parent / f".{Path(out_zarr).name}.members"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        member_paths = []
+        try:
+            for i in range(self.n_members):
+                logger.info("%s: member %d/%d", self.name, i + 1, self.n_members)
+                path = tmp_dir / f"member_{i:03d}.zarr"
+                run_deterministic([init_time], n_steps, model, data_source,
+                                  ZarrBackend(str(path)))
+                member_paths.append(path)
+
+            logger.info("Combining %d members into %s", len(member_paths), out_zarr)
+            members = [xr.open_zarr(p) for p in member_paths]
+            combined = xr.concat(members, dim="ensemble")
+            combined = combined.assign_coords(ensemble=range(len(members)))
+            combined.to_zarr(out_zarr, mode="w")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        logger.info("%s run complete. Forecast written to %s", self.name, out_zarr)
+        return out_zarr
+
+
+def _aurora1p5_backend(ensemble: bool = False, n_members: int = 1):
+    """Aurora 1.5.
+
+    NOTE on comparability: Aurora 1.5 was pretrained on ERA5 and fine-tuned
+    on IFS operational analyses -- the same lineage as AIFS. So unlike the
+    original Aurora (ERA5 throughout), initialising v1.5 from ERA5 carries
+    the same mismatch penalty the AIFS models do. That makes v1.5-vs-AIFS a
+    fairer comparison than v1-vs-AIFS was, and it means the ERA5-vs-IFS
+    truth question now applies to both families rather than only one."""
+    if ensemble:
+        from earth2studio.models.px import Aurora1p5Ensemble as Model
+        name = "aurora1.5-ens"
+    else:
+        from earth2studio.models.px import Aurora1p5 as Model
+        name = "aurora1.5"
+    return StochasticModelBackend(
+        name, Model.load_default_package, Model.load_model, n_members=n_members
+    )
+
+
 def _atlas_backend() -> ModelBackend:
     from earth2studio.models.px import Atlas
 
@@ -93,18 +175,38 @@ def _aifs_anemoi(version: str, n_members: int = 1):
 
 BACKEND_FACTORIES: dict[str, Callable[[], ModelBackend]] = {
     "aurora": _aurora_backend,
+    "aurora1.5": lambda: _aurora1p5_backend(ensemble=False),
+    # Stochastic checkpoint: repeated forward passes from the same initial
+    # condition give independent members, so --n-members works here the
+    # same way it does for aifs-ens1.0.
+    "aurora1.5-ens": lambda: _aurora1p5_backend(ensemble=True, n_members=1),
     "atlas": _atlas_backend,
     "aifs1.0": lambda: _aifs_anemoi("1.0"),
     "aifs1.1": lambda: _aifs_anemoi("1.1"),
-    # Ensemble checkpoint, but n_members=1: real ensemble members require
-    # perturbed initial conditions (ECMWF ENS stream), which the ERA5
-    # source cannot supply -- see the guard in AnemoiBackend.run.
+    # Ensemble checkpoint. Default of 1 member keeps a bare run cheap;
+    # pass --n-members to draw a real ensemble (the checkpoint samples
+    # stochastically, so repeated runs differ -- see AnemoiBackend.run).
     "aifs-ens1.0": lambda: _aifs_anemoi("ens1.0", n_members=1),
 }
 
 
-def get_backend(name: str) -> ModelBackend:
+def get_backend(name: str, n_members: int | None = None):
+    """n_members only applies to backends that support it (the anemoi
+    ensemble path). Asking for members from a deterministic backend is an
+    error rather than a silent no-op: re-running a deterministic checkpoint
+    would return identical copies, which would look like an ensemble while
+    carrying no extra information."""
     name = name.lower()
     if name not in BACKEND_FACTORIES:
         raise ValueError(f"Unknown model '{name}'. Choose from {list(BACKEND_FACTORIES)}")
-    return BACKEND_FACTORIES[name]()
+    backend = BACKEND_FACTORIES[name]()
+
+    if n_members is not None and n_members != 1:
+        if not hasattr(backend, "n_members"):
+            raise ValueError(
+                f"Model '{name}' does not support ensemble members "
+                "(only the anemoi ensemble checkpoints sample stochastically; "
+                "re-running a deterministic model would give identical copies)."
+            )
+        backend = dataclasses.replace(backend, n_members=n_members)
+    return backend
