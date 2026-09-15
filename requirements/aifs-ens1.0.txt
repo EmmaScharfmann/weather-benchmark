@@ -1,0 +1,42 @@
+# AIFS ENS v1.0. Pins straight from ECMWF's run_AIFS_ENS_v1.ipynb.
+#
+# IMPORTANT -- how the ensemble actually works: members do NOT come from
+# internal noise sampling. ECMWF's notebook varies the INITIAL CONDITIONS,
+# pulling member N from the ENS open-data stream
+# (stream='enfo', number=N) and running the model once per member.
+#
+# This pipeline initialises from ERA5, which has no such perturbed members,
+# so running this checkpoint here yields a single deterministic forecast --
+# N "members" from identical ICs would be N identical fields. See the
+# n_members guard in anemoi_backend.py.
+anemoi-inference[huggingface]==0.6.0
+anemoi-models==0.6.0
+# anemoi-datasets AND anemoi-graphs are in ECMWF's notebook but NOT here.
+# Both drag in zarr<3 (graphs -> datasets>=0.5.21 -> zarr<=2.18.7), which
+# downgrades zarr underneath arraylake/icechunk and breaks them with
+# "No module named 'zarr.abc'"; pinning zarr>=3 then makes the resolution
+# outright unsatisfiable.
+#
+# Neither is actually needed for this path: anemoi-models 0.6.0 requires
+# only anemoi-utils/einops/hydra-core/torch/torch-geometric, and
+# anemoi-inference 0.6.0 doesn't list either one. The notebook installs
+# them because its example READS anemoi datasets for input; we build the
+# input state ourselves from Arraylake and hand it to SimpleRunner, and the
+# graph is baked into the checkpoint. aifs1.0 and aifs1.1 both run without
+# them, which is the empirical check.
+#
+# zarr>=3 is stated explicitly so a future transitive zarr<3 pin fails
+# loudly at resolution instead of silently breaking the Arraylake reader.
+zarr>=3
+torch==2.5.0
+earthkit-regrid==0.4.0
+#
+# CXX11 ABI: this URL says abiFALSE, and that is load-bearing. PyPI's torch
+# 2.4/2.5 wheels are built with _GLIBCXX_USE_CXX11_ABI=0, so a flash-attn
+# built the other way imports with
+#   undefined symbol: _ZN3c105ErrorC2ENS_14SourceLocation...basic_string...
+# (the __cxx11::basic_string in that symbol is the giveaway). Newer torch
+# (2.7+) flipped to the CXX11 ABI and needs abiTRUE instead -- so the ABI
+# must be chosen to match the torch pin, not copied between files.
+flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.5cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
+scipy

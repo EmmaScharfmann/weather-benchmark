@@ -1,0 +1,23 @@
+# AIFS Single v1.1. Pins from ECMWF's run_AIFS_v1.1.ipynb on the model card.
+# A newer anemoi than 1.0 needs, but still not the current one -- 1.1 was
+# trained against anemoi-models 0.5.0, and its checkpoint pickle expects
+# those module paths.
+#
+# torch is unpinned in ECMWF's notebook; 2.5.0 is chosen here because it
+# has a matching prebuilt flash-attn wheel (see the URL below) and so
+# nothing has to compile.
+anemoi-inference[huggingface]==0.6.3
+anemoi-models==0.5.0
+torch==2.5.0
+torch-geometric==2.4.0
+earthkit-regrid==0.4.0
+#
+# CXX11 ABI: this URL says abiFALSE, and that is load-bearing. PyPI's torch
+# 2.4/2.5 wheels are built with _GLIBCXX_USE_CXX11_ABI=0, so a flash-attn
+# built the other way imports with
+#   undefined symbol: _ZN3c105ErrorC2ENS_14SourceLocation...basic_string...
+# (the __cxx11::basic_string in that symbol is the giveaway). Newer torch
+# (2.7+) flipped to the CXX11 ABI and needs abiTRUE instead -- so the ABI
+# must be chosen to match the torch pin, not copied between files.
+flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.5cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
+scipy

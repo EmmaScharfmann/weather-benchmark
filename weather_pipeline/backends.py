@@ -20,10 +20,14 @@ from dataclasses import dataclass
 from typing import Callable
 
 import torch
-from earth2studio.io import ZarrBackend
-from earth2studio.run import deterministic as run_deterministic
 
 from .datasource import ArraylakeERA5Source
+
+# NOTE: earth2studio is deliberately NOT imported at module level. The AIFS
+# backends run in envs that contain anemoi and no earth2studio at all, and
+# pipeline.py imports this module for get_backend() whichever model is
+# selected -- a top-level import here would break every AIFS run. Imported
+# inside ModelBackend.run() instead, which only earth2studio models reach.
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +54,9 @@ class ModelBackend:
         out_zarr: str,
         device: str | None = None,
     ) -> str:
+        from earth2studio.io import ZarrBackend
+        from earth2studio.run import deterministic as run_deterministic
+
         model = self.load(device)
         io = ZarrBackend(out_zarr)
         logger.info(
@@ -66,54 +73,33 @@ def _aurora_backend() -> ModelBackend:
     return ModelBackend("aurora", Aurora.load_default_package, Aurora.load_model)
 
 
-def _aifs_v1_0_package():
-    """AIFS.load_default_package() in earth2studio 0.18.0 is hardcoded to
-    v1.1 -- there's no version kwarg in this release. To get v1.0
-    specifically, build the Package manually the same way earth2studio's
-    own load_default_package() does, just pointed at the older HF repo.
-    Unverified beyond "it should work" -- AIFS derives its variable
-    ordering from each checkpoint's own ai-models.json metadata, so this
-    *should* generalize, but test it before trusting the output."""
-    from earth2studio.models.auto.package import Package
-
-    return Package(
-        "hf://ecmwf/aifs-single-1.0",
-        cache_options={
-            "cache_storage": Package.default_cache("aifs-single-1.0"),
-            "same_names": True,
-        },
-    )
-
-
-def _aifs_backend(version: str | None = None) -> ModelBackend:
-    from earth2studio.models.px import AIFS
-    if version  == "1.1":
-        name = "aifs1.1"
-        return ModelBackend(name, AIFS.load_default_package, AIFS.load_model)
-    elif version == "1.0":
-        return ModelBackend("aifs1.0", _aifs_v1_0_package, AIFS.load_model)
-    else:
-        raise ValueError(f"Unsupported AIFS version: {version!r}")
-
-
-def _aifs2_backend() -> ModelBackend:
-    from earth2studio.models.px import AIFS2
-
-    return ModelBackend("aifs2", AIFS2.load_default_package, AIFS2.load_model)
-
-
 def _atlas_backend() -> ModelBackend:
     from earth2studio.models.px import Atlas
 
     return ModelBackend("atlas", Atlas.load_default_package, Atlas.load_model)
 
 
+# AIFS no longer goes through Earth2Studio: its wrapper hardcodes a
+# checkpoint version, which made running v1.0 / v2.0 / ensemble awkward.
+# anemoi_backend drives anemoi-inference directly and derives everything
+# (variables, grid, timestep) from whichever checkpoint is loaded, so one
+# code path covers all AIFS versions. These factories return an
+# AnemoiBackend, which exposes the same `.run()` signature as ModelBackend.
+def _aifs_anemoi(version: str, n_members: int = 1):
+    from .anemoi_backend import aifs_backend
+
+    return aifs_backend(version, n_members=n_members)
+
+
 BACKEND_FACTORIES: dict[str, Callable[[], ModelBackend]] = {
     "aurora": _aurora_backend,
-    "aifs1.1": lambda: _aifs_backend(version="1.1"),      # explicit alias for "aifs" -- same checkpoint
-    "aifs1.0": lambda: _aifs_backend(version="1.0"),      # manually points at the older v1.0 HF repo -- verify before trusting
-    "aifs2": _aifs2_backend,                              # AIFS v2.0 (waves, 10 hPa level, snow cover)
     "atlas": _atlas_backend,
+    "aifs1.0": lambda: _aifs_anemoi("1.0"),
+    "aifs1.1": lambda: _aifs_anemoi("1.1"),
+    # Ensemble checkpoint, but n_members=1: real ensemble members require
+    # perturbed initial conditions (ECMWF ENS stream), which the ERA5
+    # source cannot supply -- see the guard in AnemoiBackend.run.
+    "aifs-ens1.0": lambda: _aifs_anemoi("ens1.0", n_members=1),
 }
 
 

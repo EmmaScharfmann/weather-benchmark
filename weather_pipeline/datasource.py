@@ -18,7 +18,26 @@ import pandas as pd
 import xarray as xr
 from arraylake import Client
 
-from earth2studio.data.utils import prep_data_inputs
+try:
+    from earth2studio.data.utils import prep_data_inputs
+except ModuleNotFoundError:
+    # ArraylakeERA5Source is used two ways: (a) as a model's initial-condition
+    # source, which only ever runs inside that model's own isolated uv env
+    # (earth2studio installed there -- the import above succeeds, and we use
+    # earth2studio's own normalization exactly, matching what the model
+    # expects); and (b) as a truth source for scoring, which runs in the
+    # shared base env (earth2studio deliberately NOT installed there, so
+    # isolated model envs stay isolated). This fallback covers case (b) only:
+    # a light reimplementation of the same time/variable list-ification, used
+    # solely for our own truth-fetching calls -- never for anything actually
+    # fed into a model's forward pass. If you change how earth2studio's
+    # prep_data_inputs normalizes inputs, mirror the change here too.
+    def prep_data_inputs(time, variable):
+        if isinstance(time, (str, pd.Timestamp, np.datetime64)) or not hasattr(time, "__iter__"):
+            time = [time]
+        time = [pd.Timestamp(t) for t in time]
+        variable = [variable] if isinstance(variable, str) else list(variable)
+        return time, variable
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +59,27 @@ SURFACE_ALIASES: dict[str, list[str]] = {
     "tp": ["tp", "total_precipitation"],
     "sst": ["sst", "sea_surface_temperature"],
     "lsm": ["lsm", "land_sea_mask"],
+    # --- added for AIFS/anemoi, which asks for more surface fields than
+    # the Earth2Studio models did. Skin temperature is NOT sea-surface
+    # temperature -- keep them distinct.
+    "skt": ["skt", "skin_temperature"],
+    "cp": ["cp", "convective_precipitation"],
+    "sd": ["sd", "snow_depth"],
+    "stl1": ["stl1", "soil_temperature_level_1"],
+    "stl2": ["stl2", "soil_temperature_level_2"],
+    "stl3": ["stl3", "soil_temperature_level_3"],
+    "stl4": ["stl4", "soil_temperature_level_4"],
+    "swvl1": ["swvl1", "volumetric_soil_water_layer_1"],
+    "swvl2": ["swvl2", "volumetric_soil_water_layer_2"],
+    "swvl3": ["swvl3", "volumetric_soil_water_layer_3"],
+    "swvl4": ["swvl4", "volumetric_soil_water_layer_4"],
+    # Static surface fields AIFS needs in its input state. "z_surface" is
+    # SURFACE geopotential from the single-level group -- deliberately a
+    # different id from pressure-level "z500" etc, which PRESSURE_ALIASES
+    # handles, so the two can't be confused.
+    "z_surface": ["z", "geopotential"],
+    "sdor": ["sdor", "standard_deviation_of_orography"],
+    "slor": ["slor", "slope_of_sub_gridscale_orography"],
 }
 PRESSURE_ALIASES: dict[str, list[str]] = {
     "z": ["z", "geopotential"],
@@ -66,6 +106,16 @@ def _first_match(names: list[str], candidates: list[str]) -> str:
         if c in names:
             return c
     raise KeyError(f"None of {candidates} found in dataset variables {names}")
+
+
+def _names_incl_coords(ds: xr.Dataset) -> list[str]:
+    """data_vars AND coords.
+
+    The four constant fields AIFS needs (lsm, z_sfc, slor, sdor) are stored
+    in the Arraylake ERA5 repo as 2-D COORDINATES on both groups, not as
+    data variables -- so a data_vars-only lookup reports them as missing
+    even though they're right there."""
+    return list(ds.data_vars) + list(ds.coords)
 
 
 def open_era5_repo(

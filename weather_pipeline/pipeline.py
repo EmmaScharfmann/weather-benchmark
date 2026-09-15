@@ -1,12 +1,19 @@
 """
 CLI entry point tying data -> backend -> forecast zarr together for a single
 model per run. Scoring and plotting are separate, on-demand steps (see
-scoring.py / plotting.py, or example_usage.py for the full flow) -- run them
-for whichever variable you care about, after the forecast exists.
+scoring.py / plotting.py) -- run them for whichever variable you care about,
+after the forecast exists.
 
-Usage:
-    python -m earth2studio_pipeline.pipeline \
+This module only ever imports whatever backend the caller asked for, so it's
+the thing each per-model uv environment actually runs. It does NOT know
+about uv itself -- that's scripts/run_benchmark.py's job. Called directly:
+
+    uv run --with-requirements requirements/aurora.txt \
+        -m weather_pipeline.pipeline \
         --model aurora --init-time 2026-03-13T00:00:00 --n-steps 8
+
+or, for the whole benchmark across models at once, see
+scripts/run_benchmark.py instead.
 """
 
 from __future__ import annotations
@@ -37,7 +44,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run one Earth2Studio model on Arraylake ERA5 initial conditions"
     )
-    parser.add_argument("--model", required=True, choices=["aurora", "aifs1.0", "aifs1.1", "aifs2", "atlas"])
+    parser.add_argument(
+        "--model", required=True,
+        choices=["aurora", "atlas", "aifs1.0", "aifs1.1", "aifs-ens1.0"],
+    )
     parser.add_argument("--init-time", required=True, help="e.g. 2026-03-13T00:00:00")
     parser.add_argument("--n-steps", type=int, required=True)
     parser.add_argument(

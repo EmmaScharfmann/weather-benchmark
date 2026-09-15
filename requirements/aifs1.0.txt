@@ -1,0 +1,37 @@
+# AIFS Single v1.0, run via anemoi-inference directly (not earth2studio).
+#
+# These pins come from ECMWF's own run_AIFS_v1.ipynb on the model card --
+# they are the stack the checkpoint was trained and tested against, not a
+# guess. The checkpoint is a pickled model object, so unpickling imports
+# the exact module paths that existed then; on a modern stack it fails with
+#   No module named 'torch_geometric.nn.conv.utils.inspector'  (moved in
+#     torch-geometric 2.5; present in 2.3.1/2.4.0, gone in 2.5+)
+#   No module named 'anemoi.models.layers.chunk'  (gone by anemoi-models 0.19)
+# No newer pin fixes those -- the modules no longer exist.
+#
+# Pinning a 2025-era stack for THIS model only is what per-model envs buy:
+# 1.1 and ens-1.0 pin their own, different versions, and nothing has to be
+# reconciled between them.
+#
+# anemoi-inference 0.4.x uses the older API (input_state singular; lat/lon
+# on Checkpoint rather than Metadata) -- anemoi_backend.py detects both.
+#
+# torch 2.4.0 is unpinned as to CUDA: the pytorch CUDA indexes no longer
+# carry 2.4/2.5, so this resolves from PyPI (the cu121 build), matching
+# what ECMWF's own `pip install torch==2.4.0` gets. The flash-attn wheel
+# below is the cu12/torch2.4 build, so the pair is consistent.
+anemoi-inference[huggingface]==0.4.9
+anemoi-models==0.3.1
+torch==2.4.0
+torch-geometric==2.4.0
+earthkit-regrid==0.4.0
+#
+# CXX11 ABI: this URL says abiFALSE, and that is load-bearing. PyPI's torch
+# 2.4/2.5 wheels are built with _GLIBCXX_USE_CXX11_ABI=0, so a flash-attn
+# built the other way imports with
+#   undefined symbol: _ZN3c105ErrorC2ENS_14SourceLocation...basic_string...
+# (the __cxx11::basic_string in that symbol is the giveaway). Newer torch
+# (2.7+) flipped to the CXX11 ABI and needs abiTRUE instead -- so the ABI
+# must be chosen to match the torch pin, not copied between files.
+flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.4cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
+scipy

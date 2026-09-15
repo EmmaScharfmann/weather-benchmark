@@ -1,0 +1,13 @@
+# Extra deps for the aurora backend ONLY. Layered on top of the base
+# project deps (pyproject.toml) by:
+#
+#   uv run --with-requirements requirements/aurora.txt \
+#       -m weather_pipeline.pipeline --model aurora ...
+#
+# `aurora` IS a real earth2studio extra (installs the `microsoft-aurora`
+# package) -- confirmed against the traceback: "ImportError: No module
+# named 'aurora'" when this file wrongly said earth2studio[atlas] instead.
+# natten intentionally NOT here -- that's an atlas-specific dependency,
+# not aurora's (see requirements/atlas.txt).
+torch==2.13.0+cu126
+earth2studio[aurora]

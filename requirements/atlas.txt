@@ -1,0 +1,28 @@
+
+# Extra deps for the atlas backend ONLY. Layered on top of the base
+# project deps (pyproject.toml) -- see requirements/aurora.txt for the
+# `uv run` invocation shape.
+#
+# earth2studio>=0.18 is REQUIRED: the "atlas" extra only exists from 0.18
+# onward. Older releases (0.11.0) have the Atlas model code but no matching
+# extras group, so `earth2studio[atlas]` silently resolves to a bare
+# install and Atlas then dies on a missing torch_harmonics/physicsnemo at
+# model-load time. Pinning the floor keeps the extra meaningful.
+earth2studio[atlas]>=0.18
+ 
+# CUDA build must match the system CUDA toolkit's MAJOR version (nvcc 12.9
+# here): torch refuses to compile extensions across a major gap, which is
+# what broke the torch-harmonics build on cu130. cu126 vs nvcc 12.9 is a
+# minor gap, which torch permits (warns only). natten publishes an exact
+# torch2130cu126 wheel, so nothing has to compile for natten itself.
+torch==2.13.0+cu126
+natten==0.21.7+torch2130cu126
+ 
+# torch-harmonics comes in via earth2studio[atlas], but its PUBLISHED WHEEL
+# bundles a _C extension compiled against a different torch ABI -- importing
+# it then fails with "undefined symbol: _ZNR5torch7Library4_def...". So
+# run_benchmark.py forces a source build of this one package
+# (--no-binary-package / --no-build-isolation-package, plus
+# FORCE_CUDA_EXTENSION=1). ninja keeps that build from crawling: without it
+# torch falls back to the much slower distutils backend.
+ninja
