@@ -123,7 +123,13 @@ LEVEL_DIM_CANDIDATES = ["level", "pressure_level", "isobaricInhPa"]
 # dim of length 1 for that timestamp.
 DERIVED_SURFACE: dict[str, str] = {
     "tp06": "_fetch_tp06",
+    # Sea-ice cover is absent from this repo but required by Aurora 1.5 as
+    # a time-varying input. Pulled from the public ARCO-ERA5 mirror and
+    # cached locally -- see weather_pipeline/sea_ice.py.
+    "sic": "_fetch_sic",
+
 }
+
 
 
 def _first_match(names: list[str], candidates: list[str]) -> str:
@@ -220,12 +226,69 @@ class ArraylakeERA5Source:
         tp06 = tp06.expand_dims(time=[np.datetime64(end)])
         return tp06
 
+    def _fetch_sic(self, target_time) -> xr.DataArray:
+        """Sea-ice cover for one timestamp, from ARCO-ERA5.
+
+        Same contract as the other DERIVED_SURFACE methods: one timestamp
+        in, a DataArray with a length-1 time dim out, so __call__ can
+        concatenate it alongside fields read from this repo.
+
+        Imported lazily so that gcsfs is only needed in environments that
+        actually run Aurora 1.5.
+        """
+        from .sea_ice import fetch_sea_ice
+
+        return fetch_sea_ice([target_time]).rename(None)
+
+    def _check_resolvable(self, variable) -> None:
+        """Raise once, naming every id that cannot be resolved, plus what
+        the repo actually holds."""
+        single_names = _names_incl_coords(self.single)
+        pl_names = _names_incl_coords(self.pl)
+        unresolved: dict[str, list[str]] = {}
+
+        for v in variable:
+            if v in DERIVED_SURFACE:
+                continue
+            if v in SURFACE_ALIASES:
+                if not any(c in single_names for c in SURFACE_ALIASES[v]):
+                    unresolved[v] = SURFACE_ALIASES[v]
+                continue
+            for prefix, cands in PRESSURE_ALIASES.items():
+                if v.startswith(prefix) and v[len(prefix):].isdigit():
+                    if not any(c in pl_names for c in cands):
+                        unresolved[v] = cands
+                    break
+            else:
+                unresolved[v] = ["<no alias defined>"]
+
+        if not unresolved:
+            return
+        raise KeyError(
+            f"{len(unresolved)} requested variable(s) cannot be resolved "
+            f"against the Arraylake ERA5 repo:\n"
+            + "\n".join(f"    {v}: tried {c}" for v, c in sorted(unresolved.items()))
+            + "\n\nSingle-level group holds: "
+            + f"{sorted(single_names)}\n\n"
+            "Fix by adding the repo's own spelling to SURFACE_ALIASES / "
+            "PRESSURE_ALIASES. If a field is genuinely absent from the repo "
+            "(sea-ice cover, for instance, is not in every ERA5 subset), the "
+            "model cannot be initialised from this source and needs a "
+            "different one."
+        )
+
     def __call__(self, time, variable) -> xr.DataArray:
         time, variable = prep_data_inputs(time, variable)
         logger.info(
             "Fetching %d variable(s) for %d timestamp(s): %s",
             len(variable), len(time), list(variable),
         )
+        # Resolve every requested id to a concrete repo variable BEFORE
+        # fetching anything, so one run reports all the unresolvable ones
+        # together. Failing on the first means discovering a long input list
+        # (Aurora 1.5 asks for 83) one variable per run.
+        self._check_resolvable(variable)
+
         arrays = []
         for v in variable:
             if v in DERIVED_SURFACE:
@@ -263,3 +326,25 @@ class ArraylakeERA5Source:
         out = xr.concat(arrays, dim="variable")
         logger.info("Fetched %s", dict(out.sizes))
         return out.transpose("time", "variable", "lat", "lon")
+
+
+def build_data_source(source: str = "era5"):
+    """ERA5 for historical dates, IFS for recent ones.
+
+    Lives here rather than in pipeline.py on purpose: pipeline imports
+    backends, which imports torch, and the base environment (where scoring
+    and reporting run) has no torch. Keeping the source factory in this
+    module lets run_benchmark build a data source without pulling in the
+    model stack.
+
+    The two archives barely overlap -- the public ERA5 repo lags real time
+    by about a quarter, while the IFS repo is a rolling ~two-week window --
+    so which one you want is decided by the init time. IFS is also the
+    analysis AIFS and Aurora 1.5 were fine-tuned on, at the cost of
+    forecasts that cannot be reproduced once the window moves on.
+    """
+    if source == "ifs":
+        from .ifs_datasource import ArraylakeIFSSource
+        return ArraylakeIFSSource()
+    single, pl = open_era5_repo()
+    return ArraylakeERA5Source(single, pl)

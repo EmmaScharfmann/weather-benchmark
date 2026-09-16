@@ -48,6 +48,14 @@ def load_statics(source) -> dict[str, xr.DataArray]:
     Returns {anemoi_name: DataArray(lat, lon)}, grid-standardised the same
     way the source standardises everything else (descending lat, 0-360 lon)
     so it lines up with the time-varying fields."""
+    # Sources that carry their own statics (the IFS repo keeps them on a
+    # separate branch) supply them directly; the ERA5 path reads them off
+    # the single-level group's coordinates below.
+    if hasattr(source, "get_statics"):
+        out = source.get_statics()
+        logger.info("Static fields from source: %s", sorted(out))
+        return out
+
     ds = source.single
     available = list(ds.data_vars) + list(ds.coords)
 

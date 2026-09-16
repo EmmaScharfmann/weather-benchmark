@@ -150,9 +150,9 @@ def _aurora1p5_backend(ensemble: bool = False, n_members: int = 1):
     else:
         from earth2studio.models.px import Aurora1p5 as Model
         name = "aurora1.5"
-    return StochasticModelBackend(
-        name, Model.load_default_package, Model.load_model, n_members=n_members
-    )
+    return StochasticModelBackend(name, Model.load_default_package, Model.load_model,
+                                  n_members=n_members)
+        
 
 
 def _atlas_backend() -> ModelBackend:

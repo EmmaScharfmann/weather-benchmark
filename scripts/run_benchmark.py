@@ -19,7 +19,6 @@ Add a model later by adding requirements/<name>.txt and a
 BACKEND_FACTORIES entry in weather_pipeline/backends.py -- nothing in this
 script needs to change.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -29,9 +28,10 @@ import os
 import subprocess
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
-from weather_pipeline.datasource import ArraylakeERA5Source, open_era5_repo
+from weather_pipeline.datasource import build_data_source
 from weather_pipeline.postprocess import load_forecast
 from weather_pipeline.scoring import (
     describe_metrics, fetch_truth, mean_bias_field,
@@ -129,7 +129,7 @@ def _manifest_path(out_zarr: str) -> Path:
 
 
 def existing_forecast_matches(model: str, init_time: str, n_steps: int, out_zarr: str,
-                              n_members: int | None = None) -> bool:
+                              n_members: int | None = None, source: str = "era5") -> bool:
     """True if a usable forecast for exactly this request is already on disk.
 
     Checks the manifest rather than mere existence of the zarr: a store left
@@ -147,7 +147,7 @@ def existing_forecast_matches(model: str, init_time: str, n_steps: int, out_zarr
         return False
 
     want = {"model": model, "init_time": init_time, "n_steps": n_steps,
-            "n_members": n_members}
+            "n_members": n_members, "source": source}
     got = {k: meta.get(k) for k in want}
     if got != want:
         logger.info("Existing forecast at %s is for %s, want %s; re-running",
@@ -157,7 +157,7 @@ def existing_forecast_matches(model: str, init_time: str, n_steps: int, out_zarr
 
 
 def write_manifest(model: str, init_time: str, n_steps: int, out_zarr: str,
-                   n_members: int | None = None) -> None:
+                   n_members: int | None = None, source: str = "era5") -> None:
     """Written only AFTER the run succeeds, so a crashed run leaves no
     manifest and is never mistaken for a complete forecast."""
     _manifest_path(out_zarr).write_text(json.dumps({
@@ -165,12 +165,13 @@ def write_manifest(model: str, init_time: str, n_steps: int, out_zarr: str,
         "init_time": init_time,
         "n_steps": n_steps,
         "n_members": n_members,
+        "source": source,
         "written_utc": pd.Timestamp.now("UTC").isoformat(),
     }, indent=2))
 
 
 def run_model_isolated(model: str, init_time: str, n_steps: int, out_zarr: str,
-                       n_members: int | None = None) -> None:
+                       n_members: int | None = None, source: str = "era5") -> None:
     """Runs one model's forecast to completion in its own uv environment.
 
     Each call is a fresh `uv run` invocation: uv resolves & (on first run)
@@ -201,6 +202,7 @@ def run_model_isolated(model: str, init_time: str, n_steps: int, out_zarr: str,
     ]
     if n_members is not None:
         cmd += ["--n-members", str(n_members)]
+    cmd += ["--source", source]
     logger.info("Running '%s' in its own uv env: %s", model, " ".join(cmd))
     env = dict(os.environ)
     if model == "atlas":
@@ -210,12 +212,36 @@ def run_model_isolated(model: str, init_time: str, n_steps: int, out_zarr: str,
         # imports fine but is much slower.
         env["FORCE_CUDA_EXTENSION"] = "1"
     subprocess.run(cmd, cwd=REPO_ROOT, check=True, env=env)
-    write_manifest(model, init_time, n_steps, out_zarr, n_members)
+    write_manifest(model, init_time, n_steps, out_zarr, n_members, source)
+
+
+def subsample_leads(forecast, stride_hours: int):
+    """Keep only lead times that are whole multiples of `stride_hours`.
+
+    Models report on different cadences: the AIFS checkpoints step every
+    6 h, while Earth2Studio's Aurora 1.5 wrapper emits HOURLY lead times
+    (it queries the 6-hour autoregressive step at t+1h..t+6h before
+    advancing the state, so the finer output costs no extra model
+    evaluations -- it is the same rollout, sampled more often).
+
+    Scored as-is, the two land on incompatible lead-time axes and the
+    report cannot line them up. Restricting every model to a common
+    cadence makes the comparison like-for-like; Aurora's intermediate
+    hours are still in the forecast zarr for anyone who wants them."""
+    hours = (forecast["lead_time"].values / np.timedelta64(1, "h")).astype(int)
+    keep = (hours % stride_hours) == 0
+    if keep.all():
+        return forecast
+    logger.info(
+        "Subsampling %d lead times to %d at a %d h cadence",
+        len(hours), int(keep.sum()), stride_hours,
+    )
+    return forecast.isel(valid_time=np.flatnonzero(keep))
 
 
 def score_case(
     model: str, init_time: str, out_zarr: str, variable: str,
-    data_source: ArraylakeERA5Source, metrics="all",
+    data_source, metrics="all", stride_hours: int = 6,
 ) -> None:
     """Score one (model, init_time) and write the pieces the report needs.
 
@@ -232,6 +258,7 @@ def score_case(
         report can draw spatial panels without re-reading forecasts or
         re-fetching truth from Arraylake."""
     forecast = load_forecast(out_zarr, [variable])
+    forecast = subsample_leads(forecast, stride_hours)
     truth = fetch_truth(data_source, variable, forecast["valid_time"].values)
     acc, fin = _score_case(forecast, truth, variable, metrics)
 
@@ -283,6 +310,20 @@ def main() -> None:
     )
     parser.add_argument("--variable", default="t2m")
     parser.add_argument(
+        "--score-stride-hours", type=int, default=6,
+        help="Score only lead times that are multiples of this many hours. "
+             "Aurora 1.5 emits hourly lead times while the AIFS models emit "
+             "6-hourly; 6 puts them on a common axis. Set to 1 to score every "
+             "step a model produces (then models are NOT comparable).",
+    )
+    parser.add_argument(
+        "--source", default="era5", choices=["era5", "ifs"],
+        help="Initial conditions AND verification truth. era5: historical and "
+             "reproducible but lags ~a quarter. ifs: rolling ~2-week window, "
+             "and the analysis AIFS/Aurora1.5 were fine-tuned on -- recent "
+             "dates only, and not reproducible once the window moves.",
+    )
+    parser.add_argument(
         "--metrics", default="all",
         help="Comma-separated metric names, or 'all' (default). Ensemble-only "
              "metrics are skipped automatically for deterministic forecasts "
@@ -300,8 +341,10 @@ def main() -> None:
         print("Available metrics:\n" + describe_metrics())
         return
 
-    single, pl = open_era5_repo()
-    data_source = ArraylakeERA5Source(single, pl)
+    # Same source for truth as for initial conditions, so a run is
+    # self-consistent. Scoring one analysis against another is a separate
+    # (deliberate) experiment, not something to do by accident.
+    data_source = build_data_source(args.source)
 
     failed = []
     for init_time in args.init_times:
@@ -314,11 +357,12 @@ def main() -> None:
                 stochastic = model.startswith("aifs-ens") or model.endswith("-ens")
                 members = args.n_members if stochastic else None
                 if not args.force and existing_forecast_matches(
-                    model, init_time, args.n_steps, out_zarr, members
+                    model, init_time, args.n_steps, out_zarr, members, args.source
                 ):
                     logger.info("Reusing existing forecast for %s (use --force to re-run)", label)
                 else:
-                    run_model_isolated(model, init_time, args.n_steps, out_zarr, members)
+                    run_model_isolated(model, init_time, args.n_steps, out_zarr,
+                                       members, args.source)
             except subprocess.CalledProcessError:
                 logger.exception("%s failed inside its own env -- skipping its scoring", label)
                 failed.append(label)
@@ -326,7 +370,7 @@ def main() -> None:
 
             try:
                 score_case(model, init_time, out_zarr, args.variable,
-                           data_source, args.metrics)
+                           data_source, args.metrics, args.score_stride_hours)
             except Exception:
                 logger.exception("%s produced a forecast but scoring failed", label)
                 failed.append(f"{label} (scoring)")
