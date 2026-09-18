@@ -8,13 +8,13 @@ anywhere, including CI.
 
 ## Aggregation across init times
 
-Scores are read from the per-case ACCUMULATOR files, averaged across init
-times, and finalised exactly once at the end. That ordering is the whole
-point: RMSE does not average, so mean(RMSE over 10 dates) is a different
-and wrong number. Metrics that declared themselves non-accumulable
-(activity_ratio) have no accumulator file column; those are averaged from
-their finalised per-case values and flagged in the report, because for a
-ratio that is an approximation rather than the exact multi-case value.
+Scores are read from the per-case WeatherBench-X AggregationState files,
+SUMMED, and turned into metric values exactly once at the end. That
+ordering is the whole point: RMSE does not average, so mean(RMSE over 10
+dates) is a different and wrong number. WB-X enforces the split -- a state
+holds linear statistics, and nothing is finalised until metric_values is
+called -- so the correct aggregation is structural rather than something
+this script has to remember.
 
 Images are embedded as base64 PNGs so the HTML is one portable file.
 
@@ -39,7 +39,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from weather_pipeline.scoring import REGISTRY, finalize_accumulators
+from weather_pipeline import wbx_scoring as wbx
 
 logger = logging.getLogger(__name__)
 
@@ -47,57 +47,59 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SCORES_DIR = REPO_ROOT / "outputs/scores"
 FIELDS_DIR = REPO_ROOT / "outputs/fields"
 
-# <model>_<variable>_<initslug>_accumulators.csv -- model names contain dots
-# and hyphens (aifs1.0, aifs-ens1.0), so match the fixed tail and take the
-# rest as the model rather than splitting on "_".
-_ACC_RE = re.compile(r"^(?P<model>.+)_(?P<variable>[^_]+)_(?P<init>\d{8}T\d{4})_accumulators\.csv$")
-_FIN_RE = re.compile(r"^(?P<model>.+)_(?P<variable>[^_]+)_(?P<init>\d{8}T\d{4})_metrics\.csv$")
+# <model>_<variable>_<initslug>_state.zarr -- model names contain dots and
+# hyphens (aifs1.0, aifs-ens1.0, aurora1.5-ens), so match the fixed tail and
+# take everything before it as the model rather than splitting on "_".
+# The variable tag is "t2m" globally and "t2m@europe" for a region, so the
+# report never silently mixes a regional score into a global comparison.
+_STATE_RE = re.compile(
+    r"^(?P<model>.+)_(?P<variable>[^_]+)_(?P<init>\d{8}T\d{4})_state\.zarr$"
+)
 
 
-def _collect(pattern: re.Pattern, variable: str) -> dict[str, dict[str, pd.DataFrame]]:
-    """{model: {init_slug: DataFrame}} for one variable."""
-    out: dict[str, dict[str, pd.DataFrame]] = {}
+def collect_states(variable: str) -> dict[str, tuple[list, bool]]:
+    """{model: ([AggregationState, ...], was_ensemble)} for one variable."""
+    out: dict[str, tuple[list, bool]] = {}
     if not SCORES_DIR.exists():
         return out
-    for path in sorted(SCORES_DIR.glob("*.csv")):
-        m = pattern.match(path.name)
+    for path in sorted(SCORES_DIR.glob("*_state.zarr")):
+        m = _STATE_RE.match(path.name)
         if not m or m.group("variable") != variable:
             continue
-        df = pd.read_csv(path, index_col="lead_time_h")
-        out.setdefault(m.group("model"), {})[m.group("init")] = df
+        state, ensemble = wbx.load_state(path)
+        model = m.group("model")
+        states, was_ens = out.get(model, ([], False))
+        states.append(state)
+        out[model] = (states, was_ens or ensemble)
     return out
 
 
 def aggregate(variable: str) -> tuple[dict[str, pd.DataFrame], dict[str, int], list[str]]:
-    """Per-model aggregated scores, case counts, and which columns were
-    approximated (non-accumulable metrics averaged after finalisation)."""
-    accs = _collect(_ACC_RE, variable)
-    fins = _collect(_FIN_RE, variable)
+    """Per-model aggregated scores and case counts.
 
+    Sums each model's per-case states and computes metric values once. The
+    third return value (approximated metrics) is kept for signature
+    compatibility with the report body but is now always empty: WB-X
+    aggregates every metric exactly, including the ratios the previous
+    hand-rolled implementation had to approximate."""
+    states = collect_states(variable)
     aggregated: dict[str, pd.DataFrame] = {}
     n_cases: dict[str, int] = {}
-    approximated: set[str] = set()
 
-    for model in sorted(set(accs) | set(fins)):
-        per_case_acc = list(accs.get(model, {}).values())
-        per_case_fin = list(fins.get(model, {}).values())
-        n_cases[model] = len(per_case_fin or per_case_acc)
+    for model, (model_states, was_ensemble) in sorted(states.items()):
+        n_cases[model] = len(model_states)
+        # metric_values needs the SAME metric objects the state was built
+        # with. The ensemble flag is stored in the state's attrs rather
+        # than inferred from statistic names, which was brittle.
+        metrics = wbx.build_metrics(ensemble=was_ensemble)
+        results = wbx.combine_states(model_states, metrics)
+        df = wbx.to_dataframe(results)
+        # WB-X names columns "<metric>.<variable>"; strip the variable so
+        # the plots and scorecard can address metrics by bare name.
+        df.columns = [c.split(".")[0] for c in df.columns]
+        aggregated[model] = df
 
-        frames = []
-        if per_case_acc:
-            # correct path: average inner values, THEN finalise
-            mean_acc = sum(per_case_acc) / len(per_case_acc)
-            frames.append(finalize_accumulators(mean_acc))
-        if per_case_fin:
-            extra = [c for c in per_case_fin[0].columns
-                     if not per_case_acc or c not in per_case_acc[0].columns]
-            if extra:
-                approximated.update(extra)
-                frames.append(sum(f[extra] for f in per_case_fin) / len(per_case_fin))
-        if frames:
-            aggregated[model] = pd.concat(frames, axis=1)
-
-    return aggregated, n_cases, sorted(approximated)
+    return aggregated, n_cases, []
 
 
 def _png(fig) -> str:
@@ -124,7 +126,7 @@ def plot_skill_lines(aggregated, metric: str, variable: str) -> str | None:
     ax.grid(alpha=0.3)
     if metric == "bias":
         ax.axhline(0, color="k", lw=0.8, ls="--")
-    if metric == "activity_ratio":
+    if metric in ("activity", "activity_ratio"):
         ax.axhline(1, color="k", lw=0.8, ls="--")
     ax.legend(fontsize=8)
     return _png(fig)
@@ -145,7 +147,7 @@ def plot_scorecard(aggregated, metric: str, baseline: str | None) -> str | None:
         base = frame.loc[baseline]
         # lower-is-better for every metric here except activity_ratio, which
         # has no "better" direction -- so it gets no baseline treatment.
-        if metric == "activity_ratio":
+        if metric in ("activity", "activity_ratio"):
             data, cmap, center, label = frame, "viridis", None, metric
         else:
             data = 100 * (base - frame) / base
@@ -243,17 +245,17 @@ def build_html(variable: str, baseline: str | None, title: str) -> str:
             "Run scripts/run_benchmark.py first."
         )
 
-    # Spread-skill ratio: derived from two aggregated metrics rather than
-    # stored per case, because the ratio of averages is what you want, not
-    # the average of ratios. sqrt((K+1)/K) is the standard finite-ensemble
-    # correction; without the member count we can only report the raw
-    # ratio, so note that in the report rather than silently omitting it.
-    for model, df in aggregated.items():
-        if "spread" in df and "rmse" in df:
-            df["spread_skill_ratio"] = df["spread"] / df["rmse"]
+    # NOTE: spread_skill_ratio is NOT derived here any more. WB-X computes
+    # it as UnbiasedSpreadSkillRatio, which includes the sqrt((K+1)/K)
+    # finite-ensemble correction and aggregates it exactly. Dividing the
+    # aggregated spread by the aggregated RMSE here would silently
+    # overwrite that with an uncorrected approximation.
 
+    # Stable, readable order: headline skill first, then diagnostics.
+    ORDER = ["rmse", "mse", "mae", "bias", "acc", "activity",
+             "crps", "ens_mean_rmse", "spread", "spread_skill_ratio"]
     metrics = sorted({c for df in aggregated.values() for c in df.columns},
-                     key=lambda m: list(REGISTRY).index(m) if m in REGISTRY else 99)
+                     key=lambda m: ORDER.index(m) if m in ORDER else 99)
 
     notes = []
     counts = ", ".join(f"{m}: {n}" for m, n in sorted(n_cases.items()))
@@ -264,22 +266,22 @@ def build_html(variable: str, baseline: str | None, title: str) -> str:
             "differences partly reflect which dates each model covers, not "
             "only skill.</div>"
         )
-    if approximated:
-        notes.append(
-            "<div class='note'><b>Approximated across cases:</b> "
-            f"{', '.join(approximated)}. These metrics are not linearly "
-            "averageable, so their multi-case values are the mean of "
-            "per-case values rather than an exact aggregate.</div>"
-        )
+    notes.append(
+        "<div class='note'><b>Scoring.</b> Metrics are computed by "
+        "<a href='https://github.com/google-research/weatherbenchX'>"
+        "WeatherBench-X</a>, the same code behind the WeatherBench 2 "
+        "leaderboard, so these numbers are directly comparable with "
+        "published scores. Multi-case values are exact: per-case "
+        "aggregation states are summed before any metric is finalised.</div>"
+    )
     if any("spread_skill_ratio" in df for df in aggregated.values()):
         notes.append(
-            "<div class='note'><b>Spread-skill ratio</b> is spread / "
-            "ensemble-mean RMSE, computed from the aggregated values. A "
+            "<div class='note'><b>Spread-skill ratio</b> compares the "
+            "ensemble's claimed uncertainty against its actual error. A "
             "calibrated ensemble sits near 1; below 1 is under-dispersed "
-            "(overconfident), the usual AI-ensemble failure. This is the raw "
-            "ratio -- published figures often apply a sqrt((K+1)/K) "
-            "finite-ensemble correction, which raises it slightly for small "
-            "member counts.</div>"
+            "(overconfident), the usual AI-ensemble failure. This is "
+            "WeatherBench-X's unbiased estimator, which includes the "
+            "sqrt((K+1)/K) finite-ensemble correction.</div>"
         )
     notes.append(
         "<div class='note'><b>Comparability.</b> AIFS models are initialised "
@@ -328,7 +330,11 @@ def build_html(variable: str, baseline: str | None, title: str) -> str:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)-7s %(message)s")
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--variable", default="t2m")
+    parser.add_argument(
+        "--variable", default="t2m",
+        help="Variable to report on. For a regional run use the tag the "
+             "benchmark wrote, e.g. 't2m@europe'.",
+    )
     parser.add_argument(
         "--baseline", default=None,
         help="Model to express the scorecard relative to (e.g. a climatology "

@@ -46,7 +46,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--model", required=True,
-        choices=["aurora", "aurora1.5", "aurora1.5-ens", "atlas", "aifs1.0", "aifs1.1", "aifs-ens1.0"],
+        choices=["aurora", "aurora1.5", "aurora1.5-ens", "atlas", "atlas-crps",
+         "aifs1.0", "aifs1.1", "aifs-ens1.0"],
     )
     parser.add_argument("--init-time", required=True, help="e.g. 2026-03-13T00:00:00")
     parser.add_argument("--n-steps", type=int, required=True)

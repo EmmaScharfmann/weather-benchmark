@@ -150,15 +150,44 @@ def _aurora1p5_backend(ensemble: bool = False, n_members: int = 1):
     else:
         from earth2studio.models.px import Aurora1p5 as Model
         name = "aurora1.5"
-    return StochasticModelBackend(name, Model.load_default_package, Model.load_model,
-                                  n_members=n_members)
-        
+    return StochasticModelBackend(
+        name, Model.load_default_package, Model.load_model, n_members=n_members
+    )
 
 
-def _atlas_backend() -> ModelBackend:
-    from earth2studio.models.px import Atlas
+def _atlas_backend(crps: bool = False, n_members: int = 1):
+    """Atlas, NVIDIA's generative weather model.
 
-    return ModelBackend("atlas", Atlas.load_default_package, Atlas.load_model)
+    Atlas is diffusion-like: it samples a low-resolution latent state
+    through a STOCHASTIC INTERPOLANT, so even the plain checkpoint is not
+    deterministic -- repeated calls from the same initial condition give
+    different forecasts. That makes it usable as an ensemble the same way
+    aifs-ens1.0 and aurora1.5-ens are.
+
+    `crps=True` selects Atlas CRPS, the CRPS-TRAINED ensemble variant,
+    where each forward pass draws a fresh noise vector modulating every
+    transformer block. NVIDIA score it as a 16-member ensemble. Prefer this
+    one for probabilistic work: a CRPS-trained model is calibrated by
+    construction, whereas sampling the deterministic-intent checkpoint is
+    not guaranteed to give meaningful spread."""
+    if crps:
+        try:
+            from earth2studio.models.px import AtlasCRPS as Model
+        except ImportError as exc:
+            from earth2studio.models import px
+            raise ImportError(
+                "AtlasCRPS not found in this earth2studio. Available px "
+                f"models: {sorted(n for n in dir(px) if not n.startswith('_'))}. "
+                "It may be named differently or need a newer release."
+            ) from exc
+        name = "atlas-crps"
+    else:
+        from earth2studio.models.px import Atlas as Model
+        name = "atlas"
+
+    return StochasticModelBackend(
+        name, Model.load_default_package, Model.load_model, n_members=n_members
+    )
 
 
 # AIFS no longer goes through Earth2Studio: its wrapper hardcodes a
@@ -180,7 +209,11 @@ BACKEND_FACTORIES: dict[str, Callable[[], ModelBackend]] = {
     # condition give independent members, so --n-members works here the
     # same way it does for aifs-ens1.0.
     "aurora1.5-ens": lambda: _aurora1p5_backend(ensemble=True, n_members=1),
-    "atlas": _atlas_backend,
+    # Generative (stochastic interpolant), so --n-members works here too.
+    "atlas": lambda: _atlas_backend(n_members=1),
+    # CRPS-trained ensemble variant -- the right Atlas for probabilistic
+    # comparison against aifs-ens1.0 / aurora1.5-ens.
+    "atlas-crps": lambda: _atlas_backend(crps=True, n_members=1),
     "aifs1.0": lambda: _aifs_anemoi("1.0"),
     "aifs1.1": lambda: _aifs_anemoi("1.1"),
     # Ensemble checkpoint. Default of 1 member keeps a bare run cheap;

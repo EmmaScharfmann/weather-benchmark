@@ -19,24 +19,23 @@ Add a model later by adding requirements/<name>.txt and a
 BACKEND_FACTORIES entry in weather_pipeline/backends.py -- nothing in this
 script needs to change.
 """
+
 from __future__ import annotations
 
 import argparse
 import json
 import logging
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import xarray as xr
 
 from weather_pipeline.datasource import build_data_source
-from weather_pipeline.postprocess import load_forecast
-from weather_pipeline.scoring import (
-    describe_metrics, fetch_truth, mean_bias_field,
-)
-from weather_pipeline.scoring import score_case as _score_case
+from weather_pipeline import wbx_scoring as wbx
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +87,46 @@ UV_INDEX_ARGS = [
 # official prebuilt flash-attn wheel by URL, so nothing compiles. (Kept the
 # lookup prefix-aware anyway -- if a future model does need build flags,
 # this is where they go.)
+# Models whose checkpoints sample stochastically, so repeated runs from the
+# same initial condition give independent members and --n-members is
+# meaningful. Listed explicitly rather than inferred from the name: Atlas
+# is generative (stochastic interpolant) despite having no "-ens" suffix,
+# and a deterministic model asked for members would silently return
+# identical copies with zero spread.
+#
+# run_benchmark cannot import backends to ask (that would pull in torch),
+# so this list has to be kept in step with backends.BACKEND_FACTORIES.
+STOCHASTIC_MODELS = {"aifs-ens1.0", "aurora1.5-ens", "atlas", "atlas-crps"}
+
+# Each model's NATIVE step length in hours. Earth2Studio's Aurora 1.5
+# wrapper emits hourly lead times (it queries the 6-hour autoregressive
+# step at t+1h..t+6h before advancing the state, so the finer output costs
+# no extra model evaluations); everything else steps 6-hourly.
+MODEL_STEP_HOURS = {
+    "aurora": 6, "atlas": 6, "atlas-crps": 6,
+    "aifs1.0": 6, "aifs1.1": 6, "aifs-ens1.0": 6,
+    "aurora1.5": 1, "aurora1.5-ens": 1,
+}
+
+# --n-steps counts steps of THIS cadence, for every model. Without the
+# conversion below, --n-steps 8 means 48 h for AIFS but only 8 h for
+# Aurora 1.5, and the scores end up on incomparable lead-time axes.
+BENCHMARK_STEP_HOURS = 6
+
+
+def native_steps(model: str, n_steps: int) -> int:
+    """Convert benchmark steps (6 h each) into the model's own steps."""
+    step = MODEL_STEP_HOURS.get(model, BENCHMARK_STEP_HOURS)
+    steps = n_steps * BENCHMARK_STEP_HOURS // step
+    if step != BENCHMARK_STEP_HOURS:
+        logger.info(
+            "%s steps every %d h: %d benchmark step(s) (%d h) -> %d native step(s)",
+            model, step, n_steps, n_steps * BENCHMARK_STEP_HOURS, steps,
+        )
+    return steps
+
 EXTRA_UV_ARGS: dict[str, list[str]] = {
+    # Both Atlas variants need the torch-harmonics source build.
     "atlas": [
         "--no-binary-package", "torch-harmonics",
         "--no-build-isolation-package", "torch-harmonics",
@@ -203,8 +241,26 @@ def run_model_isolated(model: str, init_time: str, n_steps: int, out_zarr: str,
     if n_members is not None:
         cmd += ["--n-members", str(n_members)]
     cmd += ["--source", source]
+    # Clear any existing store first. Earth2Studio's ZarrBackend OPENS an
+    # existing zarr rather than replacing it, so a store left by a previous
+    # run with a different number of steps keeps its old lead_time axis and
+    # the run dies partway through with
+    #   "Attempting to set a selection of 1 elements with an array of N"
+    # at exactly the step where the old axis ran out.
+    store = REPO_ROOT / out_zarr
+    if store.exists():
+        logger.info("Removing existing forecast store %s before re-running", store)
+        shutil.rmtree(store, ignore_errors=True)
+    manifest = _manifest_path(out_zarr)
+    if manifest.exists():
+        manifest.unlink()
+
     logger.info("Running '%s' in its own uv env: %s", model, " ".join(cmd))
     env = dict(os.environ)
+    if model.startswith("atlas"):
+        # Atlas asks for TF32 cuBLAS for inference performance -- it warns
+        # on every load without it, and NVIDIA's own examples set it.
+        env["TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"] = "1"
     if model == "atlas":
         # torch-harmonics only compiles its CUDA kernels when this is set;
         # earth2studio's own install docs use it for the same package.
@@ -215,70 +271,123 @@ def run_model_isolated(model: str, init_time: str, n_steps: int, out_zarr: str,
     write_manifest(model, init_time, n_steps, out_zarr, n_members, source)
 
 
-def subsample_leads(forecast, stride_hours: int):
-    """Keep only lead times that are whole multiples of `stride_hours`.
-
-    Models report on different cadences: the AIFS checkpoints step every
-    6 h, while Earth2Studio's Aurora 1.5 wrapper emits HOURLY lead times
-    (it queries the 6-hour autoregressive step at t+1h..t+6h before
-    advancing the state, so the finer output costs no extra model
-    evaluations -- it is the same rollout, sampled more often).
-
-    Scored as-is, the two land on incompatible lead-time axes and the
-    report cannot line them up. Restricting every model to a common
-    cadence makes the comparison like-for-like; Aurora's intermediate
-    hours are still in the forecast zarr for anyone who wants them."""
-    hours = (forecast["lead_time"].values / np.timedelta64(1, "h")).astype(int)
-    keep = (hours % stride_hours) == 0
-    if keep.all():
-        return forecast
-    logger.info(
-        "Subsampling %d lead times to %d at a %d h cadence",
-        len(hours), int(keep.sum()), stride_hours,
-    )
-    return forecast.isel(valid_time=np.flatnonzero(keep))
-
-
 def score_case(
-    model: str, init_time: str, out_zarr: str, variable: str,
+    model: str, init_time: str, out_zarr: str, variables: list[str],
     data_source, metrics="all", stride_hours: int = 6,
+    region: str = "global", bin_regions: bool = False,
+    climatology: str | None = None,
 ) -> None:
-    """Score one (model, init_time) and write the pieces the report needs.
+    """Score one (model, init_time) with WeatherBench-X.
 
-    Runs in THIS process -- the shared base env -- so it needs only
-    xarray/pandas, regardless of which model produced the forecast.
+    Runs in the BASE environment -- WB-X needs only xarray/numpy/beam, no
+    torch -- so it works regardless of which model produced the forecast.
 
-    Writes THREE things per case:
-      * accumulators CSV -- the linearly-averageable inner values. This is
-        what the report averages across init times before finalising, which
-        is the only correct way to aggregate RMSE-like metrics.
-      * metrics CSV -- the finalised values for this single case, for when
-        you just want to look at one forecast.
-      * bias field -- a small 2-D time-mean error map (zarr), cached so the
-        report can draw spatial panels without re-reading forecasts or
-        re-fetching truth from Arraylake."""
-    forecast = load_forecast(out_zarr, [variable])
-    forecast = subsample_leads(forecast, stride_hours)
-    truth = fetch_truth(data_source, variable, forecast["valid_time"].values)
-    acc, fin = _score_case(forecast, truth, variable, metrics)
+    Writes two things per case:
+      * an AggregationState (zarr). NOT finalised metric values: combining
+        cases means summing states and computing metrics once at the end,
+        and storing finished RMSEs would make that impossible afterwards.
+      * a small 2-D mean-bias field, cached so the report can draw spatial
+        panels without re-reading forecasts or re-fetching truth.
+
+    Also writes a per-case CSV of finalised values, purely for eyeballing a
+    single forecast -- the report ignores it and uses the states.
+    """
+    # Models differ in what they predict: Aurora 1 emits four surface
+    # variables, AIFS a dozen, and only AIFS and Aurora 1.5 produce
+    # precipitation. Score what this model has and say what it lacks,
+    # rather than failing the whole case over one missing variable.
+    available = set(xr.open_zarr(out_zarr).data_vars)
+    wanted = [v for v in variables if v in available]
+    missing = [v for v in variables if v not in available]
+    if missing:
+        logger.info("%s does not predict %s -- scoring %s", model, missing, wanted)
+    if not wanted:
+        logger.warning("%s predicts none of %s; nothing to score", model, variables)
+        return
+
+    forecast = wbx.open_forecast(out_zarr, wanted)
+    forecast = subsample_leads_wbx(forecast, stride_hours)
+
+    # Subset BEFORE fetching truth: targets are built on the forecast's own
+    # coordinates, so restricting the forecast restricts the truth fetch
+    # too -- a regional run reads only the grid points it scores.
+    if region != "global":
+        box = wbx.parse_region(region)
+        forecast = wbx.subset_region(forecast, box)
+        logger.info("Region '%s' %s -> %d x %d grid points", region, box,
+                    forecast.sizes["latitude"], forecast.sizes["longitude"])
+
+    # One truth fetch for every variable -- that is the expensive part, and
+    # the alternative (a fetch per variable) would re-read the same valid
+    # times repeatedly.
+    targets = wbx.fetch_targets(data_source, forecast, wanted)
+    ensemble = wbx.has_ensemble(forecast)
 
     slug = init_slug(init_time)
     scores_dir = REPO_ROOT / "outputs/scores"
-    scores_dir.mkdir(parents=True, exist_ok=True)
-    acc.to_csv(scores_dir / f"{model}_{variable}_{slug}_accumulators.csv")
-    fin.to_csv(scores_dir / f"{model}_{variable}_{slug}_metrics.csv")
-
     fields_dir = REPO_ROOT / "outputs/fields"
+    scores_dir.mkdir(parents=True, exist_ok=True)
     fields_dir.mkdir(parents=True, exist_ok=True)
-    bias = mean_bias_field(forecast, truth, variable)
-    # zarr, not netCDF: zarr is already a base dependency (the forecasts are
-    # zarr), whereas writing netCDF would need netCDF4/h5netcdf installed
-    # just for these few small 2-D fields.
-    bias.to_dataset().to_zarr(
-        fields_dir / f"{model}_{variable}_{slug}_bias.zarr", mode="w"
-    )
 
-    logger.info("%s @ %s metrics (%s):\n%s", model, init_time, variable, fin)
+    # A state PER VARIABLE, not one covering all of them: the report globs
+    # by variable, and models cover different variable sets, so keeping
+    # them separate means a model missing one variable still contributes to
+    # the others.
+    clim = wbx.load_climatology(climatology, wanted) if climatology else None
+    # Binning computes EVERY region in one pass, adding a `region`
+    # dimension -- unlike --region, which throws the rest of the globe away.
+    # Kept under a separate tag because the resulting states have an extra
+    # dimension the global report does not expect.
+    bins = wbx.build_binning(regions=True) if bin_regions else None
+
+    for variable in wanted:
+        state, results, _ = wbx.score_case(
+            forecast, targets, [variable], climatology=clim, bin_by=bins
+        )
+        df = wbx.to_dataframe(results)
+
+        # Region goes in the filename so global and regional scores live
+        # side by side and the report never mixes them by accident.
+        tag = variable if region == "global" else f"{variable}@{region}"
+
+        # Binned states go in their OWN directory rather than carrying a
+        # marker in the filename: zarr/fsspec treat "#" as a URL fragment
+        # separator and silently truncate the path at it, so a "#binned"
+        # suffix produced files named for everything BEFORE the marker.
+        out_dir = scores_dir / "binned" if bin_regions else scores_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        state_path = out_dir / f"{model}_{tag}_{slug}_state.zarr"
+        shutil.rmtree(state_path, ignore_errors=True)
+        # Record whether this was an ensemble: metric_values needs the same
+        # metric objects the state was built with, and the report reads the
+        # flag back rather than guessing from the stored statistic names.
+        wbx.save_state(state, state_path, ensemble=ensemble)
+        df.to_csv(out_dir / f"{model}_{tag}_{slug}_metrics.csv")
+
+        # Bias map from the SAME arrays the metrics used -- no second load
+        # of the forecast, no second truth fetch, and no risk of the map
+        # covering different lead times or a different region.
+        bias = wbx.mean_bias_field(forecast, targets, variable)
+        bias_path = fields_dir / f"{model}_{tag}_{slug}_bias.zarr"
+        shutil.rmtree(bias_path, ignore_errors=True)
+        bias.to_dataset().to_zarr(bias_path, mode="w")
+
+        logger.info("%s @ %s (%s):\n%s", model, init_time, variable, df)
+
+
+def subsample_leads_wbx(forecast, stride_hours: int):
+    """Same cadence filter as subsample_leads, on WB-X's layout where lead
+    time is its own dimension rather than folded into valid_time."""
+    hours = (forecast["lead_time"].values / np.timedelta64(1, "h")).astype(int)
+    # h=0 is the initial condition, not a forecast: Earth2Studio's iterator
+    # yields it first, and scoring it gives a meaningless perfect zero.
+    keep = (hours > 0) & (hours % stride_hours == 0)
+    if keep.all():
+        return forecast
+    logger.info("Scoring %d of %d lead times (%d h cadence)",
+                int(keep.sum()), len(hours), stride_hours)
+    return forecast.isel(lead_time=np.flatnonzero(keep))
 
 
 def main() -> None:
@@ -292,7 +401,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--models", nargs="+", required=True,
-        choices=["aurora", "aurora1.5", "aurora1.5-ens", "atlas", "aifs1.0", "aifs1.1", "aifs-ens1.0"],
+        choices=["aurora", "aurora1.5", "aurora1.5-ens", "atlas", "atlas-crps",
+         "aifs1.0", "aifs1.1", "aifs-ens1.0"],
     )
     parser.add_argument(
         "--init-times", nargs="+", required=True,
@@ -300,7 +410,13 @@ def main() -> None:
              "Every model is run for every init time; scores are aggregated "
              "across them by scripts/make_report.py.",
     )
-    parser.add_argument("--n-steps", type=int, required=True)
+    parser.add_argument(
+        "--n-steps", type=int, required=True,
+        help="Forecast length in 6-HOUR steps, the same for every model. "
+             "Models with a different native step (Aurora 1.5 runs hourly) "
+             "are converted automatically, so --n-steps 8 is +48 h "
+             "everywhere and the scores share a lead-time axis.",
+    )
     parser.add_argument(
         "--n-members", type=int, default=None,
         help="Ensemble members for checkpoints that sample stochastically "
@@ -308,7 +424,33 @@ def main() -> None:
              "state, so this multiplies runtime by n_members. Deterministic "
              "models reject values > 1 rather than returning identical copies.",
     )
-    parser.add_argument("--variable", default="t2m")
+    parser.add_argument(
+        "--variables", nargs="+", default=["t2m"],
+        help="One or more variables, e.g. t2m z500 t850 msl. Each is scored "
+             "and reported separately. Variables a model does not predict "
+             "are skipped for that model with a log line -- coverage "
+             "differs (only AIFS and Aurora 1.5 produce precipitation).",
+    )
+    parser.add_argument(
+        "--region", default="global",
+        help="Restrict scoring to a region: a name (global, europe, conus, "
+             "tropics, arctic, antarctic, north-atlantic, nh-extratropics, "
+             "sh-extratropics) or 'lat_min,lat_max,lon_min,lon_max' with "
+             "longitudes in -180..180. Results are written under a separate "
+             "tag so they never mix with global scores.",
+    )
+    parser.add_argument(
+        "--bin-regions", action="store_true",
+        help="Score every region in one pass (tropics, extratropics, "
+             "arctic, antarctic, europe, north-america) instead of only "
+             "globally. Results gain a 'region' dimension and are written "
+             "under a '#binned' tag.",
+    )
+    parser.add_argument(
+        "--climatology", default=None,
+        help="Path/URL to a climatology zarr. Required for ACC and the "
+             "activity diagnostic; without it those metrics are skipped.",
+    )
     parser.add_argument(
         "--score-stride-hours", type=int, default=6,
         help="Score only lead times that are multiples of this many hours. "
@@ -338,7 +480,8 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.list_metrics:
-        print("Available metrics:\n" + describe_metrics())
+        print("Metrics come from WeatherBench-X; see "
+              "weather_pipeline.wbx_scoring.build_metrics for the set.")
         return
 
     # Same source for truth as for initial conditions, so a run is
@@ -351,17 +494,17 @@ def main() -> None:
         for model in args.models:
             out_zarr = forecast_path(model, init_time)
             label = f"{model} @ {init_time}"
+            # --n-steps is in benchmark (6 h) steps; each model runs the
+            # number of its OWN steps that reaches the same lead time.
+            steps = native_steps(model, args.n_steps)
             try:
-                # Models whose checkpoints sample stochastically, so
-                # repeated runs give independent members.
-                stochastic = model.startswith("aifs-ens") or model.endswith("-ens")
-                members = args.n_members if stochastic else None
+                members = args.n_members if model in STOCHASTIC_MODELS else None
                 if not args.force and existing_forecast_matches(
-                    model, init_time, args.n_steps, out_zarr, members, args.source
+                    model, init_time, steps, out_zarr, members, args.source
                 ):
                     logger.info("Reusing existing forecast for %s (use --force to re-run)", label)
                 else:
-                    run_model_isolated(model, init_time, args.n_steps, out_zarr,
+                    run_model_isolated(model, init_time, steps, out_zarr,
                                        members, args.source)
             except subprocess.CalledProcessError:
                 logger.exception("%s failed inside its own env -- skipping its scoring", label)
@@ -369,8 +512,9 @@ def main() -> None:
                 continue
 
             try:
-                score_case(model, init_time, out_zarr, args.variable,
-                           data_source, args.metrics, args.score_stride_hours)
+                score_case(model, init_time, out_zarr, args.variables,
+                           data_source, args.metrics, args.score_stride_hours,
+                           args.region, args.bin_regions, args.climatology)
             except Exception:
                 logger.exception("%s produced a forecast but scoring failed", label)
                 failed.append(f"{label} (scoring)")
@@ -381,7 +525,7 @@ def main() -> None:
         logger.info(
             "Complete: %d model(s) x %d init time(s). Build the comparison with:\n"
             "    uv run scripts/make_report.py --variable %s",
-            len(args.models), len(args.init_times), args.variable,
+            len(args.models), len(args.init_times), args.variables[0],
         )
 
 

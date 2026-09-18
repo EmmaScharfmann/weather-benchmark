@@ -2,7 +2,7 @@
 name = "weather-pipeline"
 version = "0.1.0"
 description = "Open benchmark harness for Earth2Studio weather models"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 # Deliberately model-agnostic: numpy/xarray/plotting/data-access only.
 # torch + earth2studio[<model>] + any model-specific packages (anemoi,
 # aurora, ...) live in requirements/<model>.txt instead, layered on top of
@@ -21,6 +21,11 @@ dependencies = [
     "matplotlib",
     "cartopy",
     "imageio[ffmpeg]",
+    # Scoring. Not published to PyPI, so it comes from git via
+    # [tool.uv.sources] below. Pulls in apache-beam and its dependency
+    # tree, which is heavy but base-env only -- the model environments
+    # never import it, since they only run forecasts.
+    "weatherbenchX",
 ]
 
 [build-system]
@@ -50,3 +55,4 @@ explicit = true
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
+weatherbenchX = { git = "https://github.com/google-research/weatherbenchX.git" }
