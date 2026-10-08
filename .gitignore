@@ -1,6 +1,9 @@
 uv.lock
-outputs
+outputs/
 *.gif
 */__pycache__
 */.ipynb_checkpoints/
 .ipynb_checkpoints/
+data/
+logs/
+runs/

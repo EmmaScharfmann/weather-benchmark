@@ -223,12 +223,19 @@ BACKEND_FACTORIES: dict[str, Callable[[], ModelBackend]] = {
 }
 
 
-def get_backend(name: str, n_members: int | None = None):
+def get_backend(name: str, n_members: int | None = None,
+                variables: list[str] | None = None, region=None):
     """n_members only applies to backends that support it (the anemoi
     ensemble path). Asking for members from a deterministic backend is an
     error rather than a silent no-op: re-running a deterministic checkpoint
     would return identical copies, which would look like an ensemble while
-    carrying no extra information."""
+    carrying no extra information.
+
+    `variables` / `region` select which fields are kept and which box is
+    cropped at write time. They are implemented for the anemoi (AIFS)
+    backends only; asking for them on an Earth2Studio backend is an error
+    rather than being silently ignored, because the caller would then get
+    a global, all-variable zarr while believing it was regional."""
     name = name.lower()
     if name not in BACKEND_FACTORIES:
         raise ValueError(f"Unknown model '{name}'. Choose from {list(BACKEND_FACTORIES)}")
@@ -242,4 +249,20 @@ def get_backend(name: str, n_members: int | None = None):
                 "re-running a deterministic model would give identical copies)."
             )
         backend = dataclasses.replace(backend, n_members=n_members)
+
+    if variables or region:
+        if not (hasattr(backend, "variables") and hasattr(backend, "region")):
+            raise ValueError(
+                f"Model '{name}' does not support --variables/--region yet "
+                "(implemented for the anemoi AIFS backends only). Run it "
+                "without them and crop afterwards."
+            )
+        from .regions import parse_region
+        backend = dataclasses.replace(
+            backend,
+            variables=list(variables) if variables else None,
+            # parsed here, not at run time: a bad region name should fail
+            # before a 48 GB checkpoint is loaded
+            region=parse_region(region) if region else None,
+        )
     return backend

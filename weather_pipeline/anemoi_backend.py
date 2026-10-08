@@ -50,11 +50,15 @@ from __future__ import annotations
 import functools
 import itertools
 import logging
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import xarray as xr
+
+from .regions import Region, crop_indices
 
 logger = logging.getLogger(__name__)
 
@@ -249,6 +253,39 @@ def to_latlon(data) -> np.ndarray:
     return _regrid(np.asarray(data), TARGET_GRID, SOURCE_GRID)
 
 
+@functools.lru_cache(maxsize=8)
+def _crop_weights(region: Region):
+    """Regridding matrix restricted to the rows inside `region`.
+
+    The full model-grid -> 0.25 deg matrix has 721*1440 rows. Slicing it
+    down to the region's rows BEFORE the matrix-vector product means a
+    France-sized crop costs ~0.4% of a global regrid, instead of regridding
+    the whole globe and throwing 99.6% of it away."""
+    matrix, target_shape = _weights(TARGET_GRID, SOURCE_GRID)
+    if tuple(target_shape) != (OUT_LAT.size, OUT_LON.size):
+        raise RuntimeError(
+            f"Regridding target shape {tuple(target_shape)} does not match the "
+            f"assumed {(OUT_LAT.size, OUT_LON.size)} output grid; cropping "
+            "indexes into that grid, so it cannot be applied."
+        )
+    lat_idx, lon_idx = crop_indices(region, OUT_LAT, OUT_LON)
+    rows = (lat_idx[:, None] * OUT_LON.size + lon_idx[None, :]).ravel()
+    return matrix[rows], (lat_idx.size, lon_idx.size), lat_idx, lon_idx
+
+
+def to_latlon_crop(data, region: Region) -> np.ndarray:
+    """1-D model-grid values -> the 0.25 deg (lat, lon) box `region` only."""
+    matrix, shape, _, _ = _crop_weights(tuple(region))
+    out = matrix @ np.asarray(data, dtype="f8").reshape(-1)
+    return out.astype("f4").reshape(shape)
+
+
+def crop_coords(region: Region) -> tuple[np.ndarray, np.ndarray]:
+    """Latitude / longitude coordinate values of the cropped box."""
+    _, _, lat_idx, lon_idx = _crop_weights(tuple(region))
+    return OUT_LAT[lat_idx], OUT_LON[lon_idx]
+
+
 @dataclass
 class AnemoiBackend:
     """Mirrors backends.ModelBackend's `.run()` signature exactly, so
@@ -261,6 +298,15 @@ class AnemoiBackend:
     # against fetch_truth needs no further regridding.
     out_lat: np.ndarray = field(default_factory=lambda: OUT_LAT)
     out_lon: np.ndarray = field(default_factory=lambda: OUT_LON)
+    # Which output fields to keep, as ERA5/Earth2Studio channel ids ("t2m",
+    # "u10m", ...) -- anemoi's own names ("2t") are accepted too. None keeps
+    # every field the checkpoint produces (the old behaviour, which for a
+    # ~100-field checkpoint is ~0.4 GB per step per member at global 0.25 deg).
+    variables: list[str] | None = None
+    # Crop box (lat_min, lat_max, lon_min, lon_max), lon in -180..180. None
+    # keeps the whole globe. Applied inside the regridding matrix product, so
+    # the discarded part is never computed, let alone stored.
+    region: Region | None = None
 
     def _build_runner(self, device: str | None):
         import torch
@@ -328,9 +374,6 @@ class AnemoiBackend:
         # (time, variable, lat, lon) -- same source used for truth/scoring.
         da = data_source(times, e2s_ids)
 
-        model_lat = np.asarray(meta.latitudes)
-        model_lon = np.asarray(meta.longitudes)
-
         fields: dict[str, np.ndarray] = {}
 
         if static_needed:
@@ -353,6 +396,62 @@ class AnemoiBackend:
 
         return {"date": init.to_pydatetime(), "fields": fields}
 
+    # ------------------------------------------------------------------
+    # output selection
+    # ------------------------------------------------------------------
+    def _wants(self, anemoi_name: str) -> bool:
+        """Is this output field one the caller asked to keep?"""
+        if self.variables is None:
+            return True
+        wanted = set(self.variables)
+        if anemoi_name in wanted:
+            return True
+        try:
+            return anemoi_name_to_e2s(anemoi_name) in wanted
+        except KeyError:
+            return False
+
+    def _check_variables_available(self, field_names) -> None:
+        """Fail on the FIRST state, not after the whole forecast: a typo in
+        --variables should cost seconds, not a 10-day rollout."""
+        if self.variables is None:
+            return
+        have = {}
+        for n in field_names:
+            if n in ANEMOI_SKIP_FIELDS:
+                continue
+            have[n] = None
+            try:
+                have[anemoi_name_to_e2s(n)] = None
+            except KeyError:
+                pass
+        missing = [v for v in self.variables if v not in have]
+        if missing:
+            raise ValueError(
+                f"Requested variable(s) {missing} are not output fields of "
+                f"{self.hf_repo}. Output fields: "
+                f"{sorted(n for n in field_names if n not in ANEMOI_SKIP_FIELDS)}"
+            )
+
+    def _grid(self, values: np.ndarray) -> np.ndarray:
+        """Model-grid values -> the output grid (cropped if a region is set)."""
+        if self.region is None:
+            return to_latlon(values)
+        return to_latlon_crop(values, self.region)
+
+    def _out_coords(self) -> tuple[np.ndarray, np.ndarray]:
+        if self.region is None:
+            return np.asarray(self.out_lat), np.asarray(self.out_lon)
+        if not (np.array_equal(self.out_lat, OUT_LAT) and np.array_equal(self.out_lon, OUT_LON)):
+            raise NotImplementedError(
+                "Cropping assumes the default 0.25 deg output grid; a custom "
+                "out_lat/out_lon cannot be combined with region."
+            )
+        return crop_coords(self.region)
+
+    # ------------------------------------------------------------------
+    # run
+    # ------------------------------------------------------------------
     def run(
         self,
         data_source,
@@ -364,20 +463,16 @@ class AnemoiBackend:
         runner = self._build_runner(device)
         input_state = self._build_input_state(runner, data_source, init_time)
 
-        meta = dataset_metadata(runner)
         timestep = pd.Timedelta(runner.checkpoint.timestep)
         lead_time = n_steps * timestep
-        model_lat = np.asarray(meta.latitudes)
-        model_lon = np.asarray(meta.longitudes)
+        lat, lon = self._out_coords()
 
         logger.info(
-            "Running %s: init=%s, %d step(s) -> lead_time=%s",
-            self.name, init_time, n_steps, lead_time,
+            "Running %s: init=%s, %d step(s) -> lead_time=%s, members=%d, "
+            "variables=%s, region=%s",
+            self.name, init_time, n_steps, lead_time, self.n_members,
+            self.variables or "ALL", self.region or "global",
         )
-
-        # states[member][step][varname] -> regular-grid 2D array
-        per_member: list[dict[str, list[np.ndarray]]] = []
-        lead_times: list[pd.Timedelta] = []
 
         # Ensemble members come from the checkpoint's OWN stochastic
         # sampling: re-running with an identical input state produces a
@@ -387,17 +482,20 @@ class AnemoiBackend:
         #
         # That means a genuine ensemble needs no perturbed initial
         # conditions: the input state is built once, outside this loop, and
-        # each pass draws a new member. (ECMWF's own notebook additionally
-        # varies ICs from the ENS stream; doing both would sample IC
-        # uncertainty as well as model uncertainty, but model uncertainty
-        # alone already gives a usable ensemble here.)
-        #
-        # NOTE this only holds for ens checkpoints. A deterministic
+        # each pass draws a new member. NOTE this means initial-condition
+        # uncertainty is NOT sampled, so expect under-dispersion at short
+        # lead times. It only holds for ens checkpoints; a deterministic
         # checkpoint re-run would give identical members, so n_members > 1
         # is meaningful only for aifs-ens*.
+        #
+        # Each member is written to the zarr as soon as it finishes, so peak
+        # memory is one member's SELECTED fields, not every member's
+        # every field.
         for member in range(self.n_members):
+            t0 = time.perf_counter()
             collected: dict[str, list[np.ndarray]] = {}
             member_leads: list[pd.Timedelta] = []
+
             # anemoi >=0.12 takes input_states (plural, keyword-only);
             # 0.4.x took input_state. Try the modern spelling, fall back.
             try:
@@ -413,42 +511,62 @@ class AnemoiBackend:
                 # checkpoints (legacy path) and then yields bare States;
                 # with an explicit dict it yields {dataset: State}.
                 state = raw if "fields" in raw else next(iter(raw.values()))
+                if member == 0 and not member_leads:
+                    self._check_variables_available(state["fields"])
                 valid = pd.Timestamp(state["date"])
                 member_leads.append(valid - pd.Timestamp(init_time))
                 for name, values in state["fields"].items():
-                    if name in ANEMOI_SKIP_FIELDS:
+                    if name in ANEMOI_SKIP_FIELDS or not self._wants(name):
                         continue
                     arr = np.asarray(values)
                     if arr.ndim > 1:      # some releases yield (1, n_points)
                         arr = arr.reshape(-1)
-                    collected.setdefault(name, []).append(
-                        to_latlon(arr)
-                    )
-            per_member.append(collected)
-            if not lead_times:
-                lead_times = member_leads
+                    collected.setdefault(name, []).append(self._grid(arr))
 
-        ds = self._to_dataset(per_member, lead_times, init_time)
-        logger.info("Writing forecast to %s", out_zarr)
-        ds.to_zarr(out_zarr, mode="w")
+            ds = self._member_dataset(
+                collected, member_leads, init_time, member, lat, lon,
+            )
+            self._write_member(ds, out_zarr, member)
+            logger.info(
+                "%s: member %d/%d done in %.1fs (%d field(s), %d lead step(s))",
+                self.name, member + 1, self.n_members,
+                time.perf_counter() - t0, len(collected), len(member_leads),
+            )
+
+        # Sidecar marker: a crash mid-ensemble leaves a valid-looking zarr
+        # with fewer members than requested; only this file says it finished.
+        Path(str(out_zarr).rstrip("/") + ".done").write_text(
+            f"{self.name} members={self.n_members}\n"
+        )
         logger.info("%s run complete. Forecast written to %s", self.name, out_zarr)
         return out_zarr
 
-    def _to_dataset(
-        self, per_member: list[dict[str, list[np.ndarray]]],
-        lead_times: list[pd.Timedelta], init_time: str,
+    def _write_member(self, ds: xr.Dataset, out_zarr: str, member: int) -> None:
+        if member == 0:
+            ds.to_zarr(out_zarr, mode="w")
+        else:
+            ds.to_zarr(out_zarr, mode="a", append_dim="ensemble")
+
+    def _member_dataset(
+        self,
+        collected: dict[str, list[np.ndarray]],
+        lead_times: list[pd.Timedelta],
+        init_time: str,
+        member: int,
+        lat: np.ndarray,
+        lon: np.ndarray,
     ) -> xr.Dataset:
-        """Assemble into the same schema Earth2Studio's ZarrBackend writes,
-        so postprocess.load_forecast handles it unchanged: dims
-        (time, lead_time, lat, lon), one data variable per channel id, plus
-        an `ensemble` dim when running more than one member (load_forecast
-        already drops that dim when it's singleton)."""
+        """One member in the schema Earth2Studio's ZarrBackend writes, so
+        postprocess.load_forecast and wbx_scoring.open_forecast handle it
+        unchanged: dims (time, lead_time, lat, lon), one data variable per
+        channel id. With more than one member the dataset carries a length-1
+        `ensemble` dim, so successive members append along it to give
+        (time, lead_time, ensemble, lat, lon)."""
         init = np.datetime64(pd.Timestamp(init_time))
         lead = np.array([pd.Timedelta(t).to_timedelta64() for t in lead_times])
 
         data_vars = {}
-        names = sorted(per_member[0])
-        for anemoi_name in names:
+        for anemoi_name in sorted(collected):
             # store under the Earth2Studio-style id, so downstream code and
             # the other models' zarrs use identical variable names
             try:
@@ -459,27 +577,34 @@ class AnemoiBackend:
                     "under its anemoi name", anemoi_name,
                 )
                 out_name = anemoi_name
-            stacked = np.stack(
-                [np.stack(m[anemoi_name], axis=0) for m in per_member], axis=0
-            )  # (member, lead, lat, lon)
-            arr = stacked[np.newaxis, ...]  # (time=1, member, lead, lat, lon)
+            arr = np.stack(collected[anemoi_name], axis=0)  # (lead, lat, lon)
             if self.n_members == 1:
-                arr = arr[:, 0]             # (time, lead, lat, lon)
-                dims = ("time", "lead_time", "lat", "lon")
+                data_vars[out_name] = (("time", "lead_time", "lat", "lon"), arr[None])
             else:
-                arr = arr.transpose(0, 2, 1, 3, 4)
-                dims = ("time", "lead_time", "ensemble", "lat", "lon")
-            data_vars[out_name] = (dims, arr)
+                data_vars[out_name] = (
+                    ("time", "lead_time", "ensemble", "lat", "lon"),
+                    arr[None, :, None],
+                )
 
-        coords = {
-            "time": np.array([init]),
-            "lead_time": lead,
-            "lat": self.out_lat,
-            "lon": self.out_lon,
-        }
+        coords = {"time": np.array([init]), "lead_time": lead, "lat": lat, "lon": lon}
         if self.n_members > 1:
-            coords["ensemble"] = np.arange(self.n_members)
-        return xr.Dataset(data_vars, coords=coords)
+            coords["ensemble"] = np.array([member])
+        ds = xr.Dataset(data_vars, coords=coords)
+        # Attributes go on EVERY member's dataset, not just the first: each
+        # append rewrites the group attributes, so a member written without
+        # them would wipe the ones the first member set.
+        ds.attrs.update({
+            "model": self.name,
+            "hf_repo": self.hf_repo,
+            "init_time": str(pd.Timestamp(init_time)),
+            "n_members": self.n_members,
+            "region": "global" if self.region is None else list(self.region),
+            "lon_convention": "0-360; non-monotonic if the region crosses 0",
+            "ic_note": "members differ by model sampling only; the input "
+                       "state is identical, so initial-condition "
+                       "uncertainty is not sampled",
+        })
+        return ds
 
 
 def aifs_backend(version: str, n_members: int = 1) -> AnemoiBackend:

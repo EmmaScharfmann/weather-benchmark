@@ -16,8 +16,8 @@ dependencies = [
     "zarr",
     "arraylake",
     "pcodec",  # zarr codec the Arraylake ERA5 repo is compressed with -- needed
-               # anywhere that repo is read: base env AND every model env, since
-               # each model's isolated env re-fetches its own initial conditions
+    # anywhere that repo is read: base env AND every model env, since
+    # each model's isolated env re-fetches its own initial conditions
     "matplotlib",
     "cartopy",
     "imageio[ffmpeg]",
@@ -26,6 +26,12 @@ dependencies = [
     # tree, which is heavy but base-env only -- the model environments
     # never import it, since they only run forecasts.
     "weatherbenchX",
+    "ipykernel",
+    "wetterdienst",
+    "cdsapi",
+    "cfgrib",
+    "eccodes>=2.38",
+    "eccodeslib",
 ]
 
 [build-system]
