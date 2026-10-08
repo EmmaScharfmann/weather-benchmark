@@ -1,23 +1,15 @@
-"""
-Download CERRA 2 m temperature over France and store it as zarr.
+"""Download the high-resolution reanalysis used as the training target.
 
-Setup, in $HOME/.cdsapirc:
-    url: https://cds.climate.copernicus.eu/api
-    key: <API-KEY>
+Requires a Copernicus Climate Data Store account, credentials in
+``~/.cdsapirc`` and acceptance of the dataset licence on its web page.
 
-Usage:
-    uv run python scripts/download_cerra.py --years 2014 2020 --out data/cerra
-    uv run python scripts/download_cerra.py --years 2014 2020 --out data/cerra --consolidate
+Usage::
 
-What it does:
-  * static fields (orography, land-sea mask) once, from one analysis time
-  * one CDS request per month: 2 m temperature at 00/06/12/18 UTC
-  * every file is cropped to France with one fixed index box (saved in
-    crop.json), so all months share exactly the same grid
-  * each month is its own zarr (data/cerra/months/t2m_YYYYMM.zarr): an
-    interrupted run is resumed by rerunning the same command
-  * checks per month: no missing time steps, values plausible in K
-  * --consolidate merges the months into data/cerra/cerra_france_t2m.zarr
+    python scripts/download_cerra.py --config config.yaml
+    python scripts/download_cerra.py --config config.yaml --consolidate
+
+One request is issued per month and each month is written to its own store, so
+rerunning the command resumes an interrupted download.
 """
 
 from __future__ import annotations
@@ -28,401 +20,335 @@ import json
 import logging
 import shutil
 import sys
-from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
+from typing import Callable, Sequence
 
 import numpy as np
 import pandas as pd
 import xarray as xr
 
-# ---------------------------------------------------------------------------
-# constants
-# ---------------------------------------------------------------------------
-DATASET = "reanalysis-cerra-single-levels"
-FRANCE_BOX = (41.0, 51.5, -5.5, 10.0)          # lat_min, lat_max, lon_min, lon_max
-TIMES = ["00:00", "06:00", "12:00", "18:00"]   # UTC analysis times
-G = 9.80665                                    # standard gravity, m s-2
-T_RANGE_K = (220.0, 330.0)                     # plausible 2 m temperature, exclusive bounds
-
-STATIC_VARIABLES = ["orography", "land_sea_mask"]
-T2M_VARIABLE = "2m_temperature"
-OROGRAPHY_NAMES = ("orog", "z", "orography", "h")   # possible cfgrib short names
-LSM_NAMES = ("lsm", "land_sea_mask")
-T2M_NAMES = ("t2m", "2t")
-DROP_COORDS = ("step", "heightAboveGround", "surface", "valid_time", "number")
-GEOPOTENTIAL_UNITS = ("m**2s**-2", "m2s-2")
-GEOPOTENTIAL_MIN = 20000.0     # a max above this cannot be a height in m: it is geopotential
-
-CROP_FILE = "crop.json"
-GRIB_DIR = "grib"
-MONTHS_DIR = "months"
-STATIC_ZARR = "cerra_france_static.zarr"
-T2M_ZARR = "cerra_france_t2m.zarr"
-SANITY_PNG = "sanity.png"
-CONSOLIDATED_TIME_CHUNK = 124  # 31 days x 4 steps: about one month per chunk
-PLOT_REF_LAT = 46.0            # latitude used for the map aspect ratio
-
-DEFAULT_YEARS = [2014, 2020]
-DEFAULT_OUT = "data/cerra"
-DEFAULT_WORKERS = 2
-
-Opener = Callable[[Path], xr.Dataset]
+from downscale.config import Config, load_config
+from downscale.constants import G, T2M_RANGE_K
 
 logger = logging.getLogger("cerra")
 
 
-# ---------------------------------------------------------------------------
-# requests
-# ---------------------------------------------------------------------------
-def build_request(variables: Sequence[str], year: int, month: int,
-                  days: Sequence[int] | None = None, times: Sequence[str] = TIMES) -> dict:
-    """Build a CDS request for CERRA single-level analyses.
+def build_request(
+    dataset_variables: Sequence[str], year: int, month: int, times: Sequence[str],
+    days: Sequence[int] | None = None,
+) -> dict:
+    """Build one Climate Data Store request.
 
-    Parameters
-    ----------
-    variables : Sequence[str]
-        CDS variable names, e.g. ``["2m_temperature"]``.
-    year, month : int
-        Requested month.
-    days : Sequence[int], optional
-        Days of the month. Defaults to all of them.
-    times : Sequence[str]
-        UTC times as ``"HH:MM"``.
-
-    Returns
-    -------
-    dict
-        Request body for ``cdsapi.Client.retrieve`` (GRIB output).
+    :param dataset_variables: Dataset variable names.
+    :type dataset_variables: collections.abc.Sequence[str]
+    :param year: Calendar year.
+    :type year: int
+    :param month: Calendar month.
+    :type month: int
+    :param times: Times of day as ``"HH:MM"``.
+    :type times: collections.abc.Sequence[str]
+    :param days: Days of month; ``None`` requests the whole month.
+    :type days: collections.abc.Sequence[int] | None
+    :returns: Request body.
+    :rtype: dict
     """
-    ndays = calendar.monthrange(year, month)[1]
+    n_days = calendar.monthrange(year, month)[1]
     return {
         "level_type": "surface_or_atmosphere",
         "data_type": "reanalysis",
         "product_type": "analysis",
-        "variable": list(variables),
+        "variable": list(dataset_variables),
         "year": str(year),
         "month": f"{month:02d}",
-        "day": [f"{d:02d}" for d in (days or range(1, ndays + 1))],
+        "day": [f"{d:02d}" for d in (days or range(1, n_days + 1))],
         "time": list(times),
         "data_format": "grib",
     }
 
 
-def retrieve(request: dict, target: Path, client: Any | None = None) -> Path:
-    """Download one CDS request to a GRIB file.
+def retrieve(dataset: str, request: dict, target: Path, client=None) -> Path:
+    """Run one request, writing to a temporary name until it completes.
 
-    The file is written to ``<target>.part`` and renamed when complete, so an
-    interrupted download never looks finished.
-
-    Parameters
-    ----------
-    request : dict
-        Output of ``build_request``.
-    target : Path
-        Final GRIB path.
-    client : cdsapi.Client, optional
-        CDS client. A new one is created if None.
-
-    Returns
-    -------
-    Path
-        ``target``.
+    :param dataset: Dataset identifier.
+    :type dataset: str
+    :param request: Request body.
+    :type request: dict
+    :param target: Destination file.
+    :type target: pathlib.Path
+    :param client: Climate Data Store client; ``None`` builds one.
+    :type client: typing.Any
+    :returns: The destination file.
+    :rtype: pathlib.Path
     """
     if client is None:
         import cdsapi
+
         client = cdsapi.Client()
     target.parent.mkdir(parents=True, exist_ok=True)
-    part = target.with_suffix(target.suffix + ".part")
-    client.retrieve(DATASET, request, str(part))
-    part.rename(target)
+    partial = target.with_suffix(target.suffix + ".part")
+    client.retrieve(dataset, request, str(partial))
+    partial.rename(target)
     return target
 
 
-# ---------------------------------------------------------------------------
-# GRIB -> standard dataset
-# ---------------------------------------------------------------------------
 def open_grib(path: Path) -> xr.Dataset:
-    """Open a GRIB file with cfgrib, without writing an index file next to it."""
+    """Open a GRIB file.
+
+    :param path: File to open.
+    :type path: pathlib.Path
+    :returns: Dataset as decoded by ``cfgrib``.
+    :rtype: xarray.Dataset
+    """
     return xr.open_dataset(path, engine="cfgrib", backend_kwargs={"indexpath": ""})
 
 
 def standardise(ds: xr.Dataset) -> xr.Dataset:
-    """Convert cfgrib's CERRA layout to a standard form.
+    """Normalise coordinate names and longitude convention.
 
-    Uses the valid time as ``time`` (analyses have step 0), drops scalar
-    coordinates, renames latitude/longitude to ``lat``/``lon`` and wraps
-    longitudes to [-180, 180).
-
-    Parameters
-    ----------
-    ds : xr.Dataset
-        Dataset as opened by ``open_grib``.
-
-    Returns
-    -------
-    xr.Dataset
-        Dataset with 2-D ``lat``/``lon`` coordinates on the native grid dims.
-
-    Raises
-    ------
-    ValueError
-        If lat/lon are not 2-D (i.e. not the Lambert grid).
+    :param ds: Dataset as decoded from GRIB.
+    :type ds: xarray.Dataset
+    :returns: Dataset with ``lat`` and ``lon`` two-dimensional coordinates and signed longitudes.
+    :rtype: xarray.Dataset
+    :raises ValueError: If the coordinates are not two dimensional.
     """
-    if "valid_time" in ds.coords and "time" in ds.dims:
-        ds = ds.assign_coords(time=ds["valid_time"].values) if ds["valid_time"].ndim == 1 else ds
-    for c in DROP_COORDS:
-        if c in ds.coords and c not in ds.dims:
-            ds = ds.drop_vars(c)
-    ren = {k: v for k, v in {"latitude": "lat", "longitude": "lon"}.items() if k in ds.coords}
-    ds = ds.rename(ren)
+    if "valid_time" in ds.coords and "time" in ds.dims and ds["valid_time"].ndim == 1:
+        ds = ds.assign_coords(time=ds["valid_time"].values)
+    for coord in ("step", "heightAboveGround", "surface", "valid_time", "number"):
+        if coord in ds.coords and coord not in ds.dims:
+            ds = ds.drop_vars(coord)
+    renames = {k: v for k, v in {"latitude": "lat", "longitude": "lon"}.items() if k in ds.coords}
+    ds = ds.rename(renames)
     if ds["lat"].ndim != 2:
-        raise ValueError(f"expected 2-D lat/lon (Lambert grid), got dims {ds['lat'].dims}")
+        raise ValueError(f"expected two-dimensional lat/lon coordinates, got dims {ds['lat'].dims}")
     return ds.assign_coords(lon=((ds["lon"] + 180.0) % 360.0) - 180.0)
 
 
-def crop_box(lat2d: np.ndarray, lon2d: np.ndarray,
-             box: tuple[float, float, float, float] = FRANCE_BOX) -> dict:
-    """Smallest index rectangle containing every grid point inside a lat/lon box.
+def crop_box(lat2d: np.ndarray, lon2d: np.ndarray, box: tuple[float, float, float, float]) -> dict:
+    """Find the index rectangle containing a bounding box.
 
-    A rectangle in index space keeps the array regular for a CNN. Its corners
-    extend slightly outside the box, which is harmless.
+    A rectangle in index space keeps the array regular for a convolutional
+    network; its corners reach slightly outside the requested box.
 
-    Parameters
-    ----------
-    lat2d, lon2d : np.ndarray
-        Full-grid coordinates, shape (ny, nx), degrees.
-    box : tuple[float, float, float, float]
-        ``(lat_min, lat_max, lon_min, lon_max)``.
-
-    Returns
-    -------
-    dict
-        ``{"y0", "y1", "x0", "x1"}`` (end-exclusive indices), ``"grid_shape"``
-        ``[ny, nx]`` and ``"box"``. JSON-serialisable.
-
-    Raises
-    ------
-    ValueError
-        If no grid point falls inside the box.
+    :param lat2d: Grid latitudes with shape ``(y, x)``.
+    :type lat2d: numpy.ndarray
+    :param lon2d: Grid longitudes with shape ``(y, x)``, signed.
+    :type lon2d: numpy.ndarray
+    :param box: ``(lat_min, lat_max, lon_min, lon_max)``.
+    :type box: tuple[float, float, float, float]
+    :returns: Slice bounds, the source grid shape and the box.
+    :rtype: dict
+    :raises ValueError: If no grid point falls inside the box.
     """
-    la0, la1, lo0, lo1 = box
-    inside = (lat2d >= la0) & (lat2d <= la1) & (lon2d >= lo0) & (lon2d <= lo1)
+    lat_min, lat_max, lon_min, lon_max = box
+    inside = (lat2d >= lat_min) & (lat2d <= lat_max) & (lon2d >= lon_min) & (lon2d <= lon_max)
     if not inside.any():
-        raise ValueError(f"no CERRA grid point inside {box}")
+        raise ValueError(f"no grid point inside {box}")
     ys, xs = np.nonzero(inside)
-    return {"y0": int(ys.min()), "y1": int(ys.max()) + 1, "x0": int(xs.min()), "x1": int(xs.max()) + 1,
-            "grid_shape": [int(s) for s in lat2d.shape], "box": list(box)}
+    return {
+        "y0": int(ys.min()), "y1": int(ys.max()) + 1,
+        "x0": int(xs.min()), "x1": int(xs.max()) + 1,
+        "grid_shape": [int(s) for s in lat2d.shape], "box": list(box),
+    }
 
 
 def apply_crop(ds: xr.Dataset, crop: dict) -> xr.Dataset:
-    """Apply a ``crop_box`` result and rename the grid dims to ``(y, x)``.
+    """Apply a saved index rectangle.
 
-    Parameters
-    ----------
-    ds : xr.Dataset
-        Standardised dataset on the full CERRA grid.
-    crop : dict
-        Output of ``crop_box``.
-
-    Returns
-    -------
-    xr.Dataset
-        Cropped dataset with dims ``(..., y, x)``.
-
-    Raises
-    ------
-    ValueError
-        If the dataset's grid shape differs from the one the crop was made on.
+    :param ds: Dataset on the full source grid.
+    :type ds: xarray.Dataset
+    :param crop: Rectangle from :func:`crop_box`.
+    :type crop: dict
+    :returns: Cropped dataset with dimensions named ``y`` and ``x``.
+    :rtype: xarray.Dataset
+    :raises ValueError: If the dataset's grid differs from the one the rectangle was built for.
     """
-    ydim, xdim = ds["lat"].dims
-    shape = [int(ds.sizes[ydim]), int(ds.sizes[xdim])]
+    y_dim, x_dim = ds["lat"].dims
+    shape = [int(ds.sizes[y_dim]), int(ds.sizes[x_dim])]
     if shape != crop["grid_shape"]:
         raise ValueError(f"grid {shape} differs from the saved crop's grid {crop['grid_shape']}")
-    out = ds.isel({ydim: slice(crop["y0"], crop["y1"]), xdim: slice(crop["x0"], crop["x1"])})
-    return out.rename({ydim: "y", xdim: "x"}) if (ydim, xdim) != ("y", "x") else out
+    out = ds.isel({y_dim: slice(crop["y0"], crop["y1"]), x_dim: slice(crop["x0"], crop["x1"])})
+    return out.rename({y_dim: "y", x_dim: "x"}) if (y_dim, x_dim) != ("y", "x") else out
 
 
 def _clean(ds: xr.Dataset) -> xr.Dataset:
-    """Drop GRIB encodings and attributes in place so the dataset writes cleanly to zarr."""
-    for v in ds.variables.values():
-        v.encoding.clear()
+    """Strip encodings and GRIB attributes before writing.
+
+    :param ds: Dataset to clean.
+    :type ds: xarray.Dataset
+    :returns: The same dataset, modified in place.
+    :rtype: xarray.Dataset
+    """
+    for variable in ds.variables.values():
+        variable.encoding.clear()
     ds.attrs = {k: v for k, v in ds.attrs.items() if not k.startswith("GRIB")}
     return ds
 
 
-# ---------------------------------------------------------------------------
-# checks
-# ---------------------------------------------------------------------------
-def expected_times(year: int, month: int, times: Sequence[str] = TIMES) -> pd.DatetimeIndex:
-    """All expected time stamps of a month: every day at each of ``times``."""
-    ndays = calendar.monthrange(year, month)[1]
-    days = pd.date_range(f"{year}-{month:02d}-01", periods=ndays, freq="D")
+def expected_times(year: int, month: int, times: Sequence[str]) -> pd.DatetimeIndex:
+    """List every timestamp a complete month should contain.
+
+    :param year: Calendar year.
+    :type year: int
+    :param month: Calendar month.
+    :type month: int
+    :param times: Times of day as ``"HH:MM"``.
+    :type times: collections.abc.Sequence[str]
+    :returns: Expected timestamps.
+    :rtype: pandas.DatetimeIndex
+    """
+    n_days = calendar.monthrange(year, month)[1]
+    days = pd.date_range(f"{year}-{month:02d}-01", periods=n_days, freq="D")
     return pd.DatetimeIndex([d + pd.Timedelta(t + ":00") for d in days for t in times])
 
 
-def check_month(ds: xr.Dataset, year: int, month: int) -> list[str]:
-    """Check completeness and plausibility of one month of ``t2m``.
+def check_month(ds: xr.Dataset, year: int, month: int, times: Sequence[str]) -> list[str]:
+    """Check one month for missing, duplicate or implausible values.
 
-    Parameters
-    ----------
-    ds : xr.Dataset
-        Month dataset with a ``t2m`` variable in K and a ``time`` dim.
-    year, month : int
-        Month the dataset should cover.
-
-    Returns
-    -------
-    list[str]
-        Human-readable problems (missing or duplicate times, NaNs, values
-        outside ``T_RANGE_K``). Empty if the month is fine.
+    :param ds: Cropped month with a ``t2m`` variable.
+    :type ds: xarray.Dataset
+    :param year: Calendar year.
+    :type year: int
+    :param month: Calendar month.
+    :type month: int
+    :param times: Expected times of day.
+    :type times: collections.abc.Sequence[str]
+    :returns: Human-readable problems; empty when the month is sound.
+    :rtype: list[str]
     """
     problems = []
-    got = pd.DatetimeIndex(ds["time"].values)
-    missing = expected_times(year, month).difference(got)
+    found = pd.DatetimeIndex(ds["time"].values)
+    missing = expected_times(year, month, times).difference(found)
     if len(missing):
         problems.append(f"{len(missing)} missing time(s), e.g. {list(missing[:3])}")
-    if got.has_duplicates:
+    if found.has_duplicates:
         problems.append("duplicate times")
-    t = ds["t2m"].values
-    if np.isnan(t).any():
-        problems.append(f"{int(np.isnan(t).sum())} NaN value(s)")
-    lo, hi = float(np.nanmin(t)), float(np.nanmax(t))
-    if not (T_RANGE_K[0] < lo and hi < T_RANGE_K[1]):
-        problems.append(f"t2m range {lo:.1f}..{hi:.1f} K outside {T_RANGE_K}")
+    values = ds["t2m"].values
+    if np.isnan(values).any():
+        problems.append(f"{int(np.isnan(values).sum())} NaN value(s)")
+    low, high = float(np.nanmin(values)), float(np.nanmax(values))
+    if not (T2M_RANGE_K[0] < low and high < T2M_RANGE_K[1]):
+        problems.append(f"t2m range {low:.1f}..{high:.1f} K outside {T2M_RANGE_K}")
     return problems
 
 
-# ---------------------------------------------------------------------------
-# steps
-# ---------------------------------------------------------------------------
-def load_or_make_crop(out: Path, ds_std: xr.Dataset) -> dict:
-    """Read ``crop.json`` from ``out``, or compute it from ``ds_std`` and save it.
+def load_or_make_crop(out: Path, standardised: xr.Dataset, box) -> dict:
+    """Read the saved index rectangle, computing it on first use.
 
-    Parameters
-    ----------
-    out : Path
-        Output directory.
-    ds_std : xr.Dataset
-        Standardised full-grid dataset (only used if no crop is saved yet).
-
-    Returns
-    -------
-    dict
-        Crop as returned by ``crop_box``.
+    :param out: Output directory.
+    :type out: pathlib.Path
+    :param standardised: Dataset carrying the full source grid.
+    :type standardised: xarray.Dataset
+    :param box: Bounding box.
+    :type box: tuple[float, float, float, float]
+    :returns: The rectangle, shared by every month.
+    :rtype: dict
     """
-    f = out / CROP_FILE
-    if f.exists():
-        return json.loads(f.read_text())
-    crop = crop_box(ds_std["lat"].values, ds_std["lon"].values)
-    f.write_text(json.dumps(crop, indent=2))
-    logger.info("crop fixed: y %d:%d, x %d:%d of grid %s -> %d x %d points",
-                crop["y0"], crop["y1"], crop["x0"], crop["x1"], crop["grid_shape"],
-                crop["y1"] - crop["y0"], crop["x1"] - crop["x0"])
+    path = out / "crop.json"
+    if path.exists():
+        return json.loads(path.read_text())
+    crop = crop_box(standardised["lat"].values, standardised["lon"].values, box)
+    path.write_text(json.dumps(crop, indent=2))
+    logger.info(
+        "crop fixed: y %d:%d, x %d:%d of grid %s, giving %d x %d points",
+        crop["y0"], crop["y1"], crop["x0"], crop["x1"], crop["grid_shape"],
+        crop["y1"] - crop["y0"], crop["x1"] - crop["x0"],
+    )
     return crop
 
 
-def do_static(out: Path, year: int, client: Any | None = None, opener: Opener = open_grib) -> Path:
-    """Download, crop and save orography (m) and land-sea mask. Skipped if already done.
+def do_static(cfg: Config, out: Path, client=None, opener: Callable = open_grib) -> Path:
+    """Download and crop the time-invariant fields.
 
-    Parameters
-    ----------
-    out : Path
-        Output directory.
-    year : int
-        Year of the analysis time the fields are taken from (1 Jan, 00 UTC).
-    client : cdsapi.Client, optional
-        CDS client, passed to ``retrieve``.
-    opener : Callable[[Path], xr.Dataset]
-        GRIB reader (replaceable in tests).
-
-    Returns
-    -------
-    Path
-        Path of ``cerra_france_static.zarr``.
-
-    Raises
-    ------
-    KeyError
-        If orography or land-sea mask is missing from the GRIB.
+    :param cfg: Pipeline configuration.
+    :type cfg: weather_pipeline.config.Config
+    :param out: Output directory.
+    :type out: pathlib.Path
+    :param client: Climate Data Store client; ``None`` builds one.
+    :type client: typing.Any
+    :param opener: Callable opening a GRIB file, replaceable for testing.
+    :type opener: typing.Callable
+    :returns: Path to the static store.
+    :rtype: pathlib.Path
+    :raises KeyError: If the orography or land-sea mask is absent from the response.
     """
-    target = out / STATIC_ZARR
+    target = out / "static.zarr"
     if target.exists():
-        logger.info("static fields already done")
+        logger.info("static fields already downloaded")
         return target
-    grib = out / GRIB_DIR / "static.grib"
+    grib = out / "grib" / "static.grib"
     if not grib.exists():
-        retrieve(build_request(STATIC_VARIABLES, year, 1, days=[1], times=["00:00"]), grib, client)
+        request = build_request(cfg.target.static_variables, cfg.target.years[0], 1, ["00:00"], days=[1])
+        retrieve(cfg.target.dataset, request, grib, client)
     ds = standardise(opener(grib))
-    crop = load_or_make_crop(out, ds)
+    crop = load_or_make_crop(out, ds, cfg.region_box)
     ds = apply_crop(ds, crop)
-    ds = ds.isel(time=0, drop=True) if "time" in ds.dims else ds
-    oro = next((v for v in ds.data_vars if v in OROGRAPHY_NAMES), None)
-    lsm = next((v for v in ds.data_vars if v in LSM_NAMES), None)
-    if oro is None or lsm is None:
-        raise KeyError(f"orography / land-sea mask not found in static GRIB; variables: {list(ds.data_vars)}")
-    h = ds[oro].astype("f4")
-    if str(h.attrs.get("units", "")).replace(" ", "") in GEOPOTENTIAL_UNITS or float(h.max()) > GEOPOTENTIAL_MIN:
-        h = h / G
-    st = xr.Dataset({"orography": h.assign_attrs(units="m"),
-                     "land_sea_mask": ds[lsm].astype("f4").assign_attrs(units="1")},
-                    coords={"lat": ds["lat"], "lon": ds["lon"]})
-    st.attrs = {"source": "CERRA (C3S), cropped to France", "crop": json.dumps(crop)}
-    _clean(st).to_zarr(target, mode="w")
-    logger.info("static: orography %.0f..%.0f m, land fraction %.2f",
-                float(st.orography.min()), float(st.orography.max()), float(st.land_sea_mask.mean()))
+    if "time" in ds.dims:
+        ds = ds.isel(time=0, drop=True)
+    orography_name = next((v for v in ds.data_vars if v in ("orog", "z", "orography", "h")), None)
+    mask_name = next((v for v in ds.data_vars if v in ("lsm", "land_sea_mask")), None)
+    if orography_name is None or mask_name is None:
+        raise KeyError(f"orography or land-sea mask not found; variables: {list(ds.data_vars)}")
+    height = ds[orography_name].astype("f4")
+    units = str(height.attrs.get("units", "")).replace(" ", "")
+    if units in ("m**2s**-2", "m2s-2") or float(height.max()) > 20000:
+        height = height / G
+    static = xr.Dataset(
+        {
+            "orography": height.assign_attrs(units="m"),
+            "land_sea_mask": ds[mask_name].astype("f4").assign_attrs(units="1"),
+        },
+        coords={"lat": ds["lat"], "lon": ds["lon"]},
+    )
+    static.attrs = {"source": f"{cfg.target.dataset}, cropped", "crop": json.dumps(crop)}
+    _clean(static).to_zarr(target, mode="w")
+    logger.info(
+        "static fields: orography %.0f..%.0f m, land fraction %.2f",
+        float(static.orography.min()), float(static.orography.max()), float(static.land_sea_mask.mean()),
+    )
     return target
 
 
-def do_month(out: Path, year: int, month: int, keep_grib: bool = False,
-             client: Any | None = None, opener: Opener = open_grib) -> tuple[str, list[str]]:
-    """Download, crop, check and save one month of 2 m temperature.
+def do_month(
+    cfg: Config, out: Path, year: int, month: int, keep_grib: bool = False,
+    client=None, opener: Callable = open_grib,
+) -> tuple[str, list[str]]:
+    """Download, crop and check one month.
 
-    Skipped if the month's zarr already exists. If the checks fail, nothing is
-    written and the GRIB is kept for inspection; it is reused (not re-downloaded)
-    on the next run until deleted by hand.
-
-    Parameters
-    ----------
-    out : Path
-        Output directory.
-    year, month : int
-        Month to process.
-    keep_grib : bool
-        Keep the GRIB after a successful write.
-    client : cdsapi.Client, optional
-        CDS client, passed to ``retrieve``.
-    opener : Callable[[Path], xr.Dataset]
-        GRIB reader (replaceable in tests).
-
-    Returns
-    -------
-    tuple[str, list[str]]
-        ``("YYYYMM", problems)``, with ``problems`` empty on success.
-
-    Raises
-    ------
-    KeyError
-        If 2 m temperature is missing from the GRIB.
+    :param cfg: Pipeline configuration.
+    :type cfg: weather_pipeline.config.Config
+    :param out: Output directory.
+    :type out: pathlib.Path
+    :param year: Calendar year.
+    :type year: int
+    :param month: Calendar month.
+    :type month: int
+    :param keep_grib: Keep the downloaded GRIB file after cropping.
+    :type keep_grib: bool
+    :param client: Climate Data Store client; ``None`` builds one.
+    :type client: typing.Any
+    :param opener: Callable opening a GRIB file, replaceable for testing.
+    :type opener: typing.Callable
+    :returns: The month tag and any problems found; nothing is written when problems exist.
+    :rtype: tuple[str, list[str]]
+    :raises KeyError: If the target variable is absent from the response.
     """
     tag = f"{year}{month:02d}"
-    target = out / MONTHS_DIR / f"t2m_{tag}.zarr"
+    target = out / "months" / f"t2m_{tag}.zarr"
     if target.exists():
         return tag, []
-    grib = out / GRIB_DIR / f"t2m_{tag}.grib"
+    grib = out / "grib" / f"t2m_{tag}.grib"
     if not grib.exists():
         logger.info("requesting %s", tag)
-        retrieve(build_request([T2M_VARIABLE], year, month), grib, client)
+        retrieve(cfg.target.dataset, build_request([cfg.target.variable], year, month, cfg.target.times), grib, client)
     ds = standardise(opener(grib))
-    crop = load_or_make_crop(out, ds)
-    ds = apply_crop(ds, crop)
-    var = next((v for v in ds.data_vars if v in T2M_NAMES), None)
-    if var is None:
+    ds = apply_crop(ds, load_or_make_crop(out, ds, cfg.region_box))
+    name = next((v for v in ds.data_vars if v in ("t2m", "2t")), None)
+    if name is None:
         raise KeyError(f"2 m temperature not found; variables: {list(ds.data_vars)}")
-    ds = ds[[var]].rename({var: "t2m"}).sortby("time")
+    ds = ds[[name]].rename({name: "t2m"}).sortby("time")
     ds["t2m"] = ds["t2m"].astype("f4").assign_attrs(units="K")
-    problems = check_month(ds, year, month)
+    problems = check_month(ds, year, month, cfg.target.times)
     if problems:
         return tag, problems
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -435,145 +361,145 @@ def do_month(out: Path, year: int, month: int, keep_grib: bool = False,
     return tag, []
 
 
-def consolidate(out: Path, years: tuple[int, int]) -> Path:
-    """Concatenate all monthly zarrs of ``years`` into ``cerra_france_t2m.zarr``.
+def consolidate(cfg: Config, out: Path) -> Path:
+    """Merge the downloaded months into a single store.
 
-    Parameters
-    ----------
-    out : Path
-        Output directory.
-    years : tuple[int, int]
-        First and last year, inclusive.
-
-    Returns
-    -------
-    Path
-        Path of the consolidated zarr, ``t2m`` with dims (time, y, x).
-
-    Raises
-    ------
-    FileNotFoundError
-        If any month of the period is missing.
-    ValueError
-        If the t2m grid differs from the static grid.
+    :param cfg: Pipeline configuration.
+    :type cfg: weather_pipeline.config.Config
+    :param out: Output directory.
+    :type out: pathlib.Path
+    :returns: Path to the consolidated store.
+    :rtype: pathlib.Path
+    :raises FileNotFoundError: If any month is still missing.
+    :raises ValueError: If the static grid and the monthly grid differ.
     """
-    tags = [f"{y}{m:02d}" for y in range(years[0], years[1] + 1) for m in range(1, 13)]
-    paths = [out / MONTHS_DIR / f"t2m_{t}.zarr" for t in tags]
+    first, last = cfg.target.years
+    tags = [f"{y}{m:02d}" for y in range(int(first), int(last) + 1) for m in range(1, 13)]
+    paths = [out / "months" / f"t2m_{t}.zarr" for t in tags]
     missing = [p.name for p in paths if not p.exists()]
     if missing:
         raise FileNotFoundError(f"{len(missing)} month(s) not downloaded yet, e.g. {missing[:3]}")
     ds = xr.open_mfdataset([str(p) for p in paths], engine="zarr", combine="nested", concat_dim="time")
-    ds = ds.chunk({"time": CONSOLIDATED_TIME_CHUNK, "y": -1, "x": -1})
+    ds = ds.chunk({"time": 124, "y": -1, "x": -1})
     times = pd.DatetimeIndex(ds.time.values)
-    assert times.is_monotonic_increasing and not times.has_duplicates
-    st = xr.open_zarr(out / STATIC_ZARR)
-    if not (np.array_equal(st.lat.values, ds.lat.values) and np.array_equal(st.lon.values, ds.lon.values)):
-        raise ValueError("static grid and t2m grid differ")
-    ds.attrs = {"source": "CERRA (C3S), 2 m temperature analysis, cropped to France",
-                "years": f"{years[0]}-{years[1]}", "times_utc": ",".join(TIMES),
-                "license": "Copernicus licence; contains modified C3S information"}
-    target = out / T2M_ZARR
+    if not times.is_monotonic_increasing or times.has_duplicates:
+        raise ValueError("consolidated times are not strictly increasing")
+    static = xr.open_zarr(out / "static.zarr")
+    if not (np.array_equal(static.lat.values, ds.lat.values) and np.array_equal(static.lon.values, ds.lon.values)):
+        raise ValueError("the static grid and the monthly grid differ")
+    ds.attrs = {
+        "source": f"{cfg.target.dataset}, cropped",
+        "years": f"{first}-{last}",
+        "times_utc": ",".join(cfg.target.times),
+        "license": "Copernicus licence; contains modified Copernicus Climate Change Service information",
+    }
+    target = out / "target.zarr"
     _clean(ds).to_zarr(target, mode="w")
-    logger.info("consolidated %d time steps, grid %d x %d -> %s",
-                ds.sizes["time"], ds.sizes["y"], ds.sizes["x"], target)
+    logger.info(
+        "consolidated %d time steps on a %d x %d grid into %s",
+        ds.sizes["time"], ds.sizes["y"], ds.sizes["x"], target,
+    )
     return target
 
 
 def sanity_plot(out: Path, tag: str, path: Path) -> None:
-    """Save a figure of the month's warmest time step next to the orography.
+    """Plot the warmest step of a month next to the orography.
 
-    Parameters
-    ----------
-    out : Path
-        Output directory (must contain the month and the static zarr).
-    tag : str
-        Month as ``"YYYYMM"``.
-    path : Path
-        PNG file to write.
+    :param out: Output directory.
+    :type out: pathlib.Path
+    :param tag: Month tag such as ``"201407"``.
+    :type tag: str
+    :param path: Destination image.
+    :type path: pathlib.Path
+    :returns: ``None``
+    :rtype: None
     """
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    ds = xr.open_zarr(out / MONTHS_DIR / f"t2m_{tag}.zarr")
-    st = xr.open_zarr(out / STATIC_ZARR)
-    i = int(np.argmax(ds.t2m.mean(("y", "x")).values))
+
+    ds = xr.open_zarr(out / "months" / f"t2m_{tag}.zarr")
+    static = xr.open_zarr(out / "static.zarr")
+    index = int(np.argmax(ds.t2m.mean(("y", "x")).values))
     fig, ax = plt.subplots(1, 2, figsize=(12, 5), constrained_layout=True)
-    a = ax[0].pcolormesh(ds.lon, ds.lat, ds.t2m.isel(time=i) - 273.15, cmap="RdYlBu_r", shading="auto")
-    fig.colorbar(a, ax=ax[0], label="°C")
-    ax[0].set_title(f"CERRA 2 m temperature, {pd.Timestamp(ds.time.values[i]):%Y-%m-%d %H UTC}")
-    b = ax[1].pcolormesh(st.lon, st.lat, st.orography, cmap="terrain", shading="auto")
-    fig.colorbar(b, ax=ax[1], label="m")
-    ax[1].set_title("CERRA orography")
-    for a_ in ax:
-        a_.set_aspect(1 / np.cos(np.deg2rad(PLOT_REF_LAT)))
+    temperature = ax[0].pcolormesh(ds.lon, ds.lat, ds.t2m.isel(time=index) - 273.15, cmap="RdYlBu_r", shading="auto")
+    fig.colorbar(temperature, ax=ax[0], label="degC")
+    ax[0].set_title(f"2 m temperature, {pd.Timestamp(ds.time.values[index]):%Y-%m-%d %H UTC}")
+    orography = ax[1].pcolormesh(static.lon, static.lat, static.orography, cmap="terrain", shading="auto")
+    fig.colorbar(orography, ax=ax[1], label="m")
+    ax[1].set_title("orography")
+    mid_lat = float(np.mean(static.lat.values))
+    for axis in ax:
+        axis.set_aspect(1 / np.cos(np.deg2rad(mid_lat)))
     fig.savefig(path, dpi=110)
     plt.close(fig)
-    logger.info("sanity plot: %s", path)
+    logger.info("sanity plot written to %s", path)
 
 
-# ---------------------------------------------------------------------------
-# command line
-# ---------------------------------------------------------------------------
 def main(argv: Sequence[str] | None = None) -> int:
     """Command-line entry point.
 
-    Parameters
-    ----------
-    argv : Sequence[str], optional
-        Arguments (defaults to ``sys.argv[1:]``).
-
-    Returns
-    -------
-    int
-        Exit code: 0 if every month succeeded (or for --consolidate/--dry-run), else 1.
+    :param argv: Argument list; ``None`` reads ``sys.argv``.
+    :type argv: collections.abc.Sequence[str] | None
+    :returns: Exit status, non-zero when a month reported problems.
+    :rtype: int
     """
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--years", nargs=2, type=int, default=DEFAULT_YEARS, metavar=("FIRST", "LAST"))
-    p.add_argument("--out", default=DEFAULT_OUT)
-    p.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="concurrent CDS requests (keep small)")
-    p.add_argument("--keep-grib", action="store_true")
-    p.add_argument("--consolidate", action="store_true", help="merge finished months into one zarr")
-    p.add_argument("--dry-run", action="store_true", help="print the requests, download nothing")
-    a = p.parse_args(argv)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--config", default=None)
+    parser.add_argument("--out", default=None, help="overrides paths.target")
+    parser.add_argument("--workers", type=int, default=None, help="overrides target.cds_workers")
+    parser.add_argument("--keep-grib", action="store_true")
+    parser.add_argument("--consolidate", action="store_true")
+    parser.add_argument("--dry-run", action="store_true", help="print the requests and exit")
+    args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-    out = Path(a.out)
-    out.mkdir(parents=True, exist_ok=True)
-    years = (a.years[0], a.years[1])
 
-    if a.consolidate:
-        consolidate(out, years)
+    cfg = load_config(args.config)
+    out = Path(args.out or cfg.paths.target)
+    out.mkdir(parents=True, exist_ok=True)
+    workers = args.workers or cfg.target.cds_workers
+    first, last = int(cfg.target.years[0]), int(cfg.target.years[1])
+    months = [(y, m) for y in range(first, last + 1) for m in range(1, 13)]
+
+    if args.consolidate:
+        consolidate(cfg, out)
         return 0
-    months = [(y, m) for y in range(years[0], years[1] + 1) for m in range(1, 13)]
-    if a.dry_run:
-        print(json.dumps(build_request(STATIC_VARIABLES, years[0], 1, days=[1], times=["00:00"]), indent=1))
-        print(json.dumps(build_request([T2M_VARIABLE], *months[0]), indent=1))
+    if args.dry_run:
+        print(json.dumps(build_request(cfg.target.static_variables, first, 1, ["00:00"], days=[1]), indent=1))
+        print(json.dumps(build_request([cfg.target.variable], *months[0], cfg.target.times), indent=1))
         print(f"... {len(months)} monthly requests in total")
         return 0
 
-    do_static(out, years[0])
+    do_static(cfg, out)
     failed: dict[str, list[str]] = {}
-    with ThreadPoolExecutor(max_workers=a.workers) as pool:
-        futs = {pool.submit(do_month, out, y, m, a.keep_grib): (y, m) for y, m in months}
-        for n, f in enumerate(as_completed(futs), 1):
-            y, m = futs[f]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(do_month, cfg, out, y, m, args.keep_grib): (y, m) for y, m in months}
+        for n, future in enumerate(as_completed(futures), 1):
+            year, month = futures[future]
             try:
-                tag, problems = f.result()
+                tag, problems = future.result()
                 if problems:
                     failed[tag] = problems
-                logger.info("[%d/%d] %d-%02d %s", n, len(months), y, m,
-                            "PROBLEMS: " + "; ".join(problems) if problems else "ok")
-            except Exception as e:  # noqa: BLE001
-                failed[f"{y}{m:02d}"] = [repr(e)]
-                logger.error("[%d/%d] %d-%02d failed: %r", n, len(months), y, m, e)
+                logger.info(
+                    "[%d/%d] %d-%02d %s", n, len(months), year, month,
+                    "problems: " + "; ".join(problems) if problems else "ok",
+                )
+            except Exception as exc:  # noqa: BLE001
+                failed[f"{year}{month:02d}"] = [repr(exc)]
+                logger.error("[%d/%d] %d-%02d failed: %r", n, len(months), year, month, exc)
 
-    done = sorted(p.stem.split("_")[1] for p in (out / MONTHS_DIR).glob("t2m_*.zarr"))
+    done = sorted(p.stem.split("_")[1] for p in (out / "months").glob("t2m_*.zarr"))
     if done:
-        sanity_plot(out, done[len(done) // 2 if len(done) > 1 else 0], out / SANITY_PNG)
-    print(f"\n{len(done)}/{len(months)} months done; {len(failed)} with problems")
-    for tag, probs in sorted(failed.items()):
-        print(f"  {tag}: {'; '.join(probs)}")
-    print("rerun the same command to retry; then add --consolidate" if failed or len(done) < len(months)
-          else "all months done: now run with --consolidate")
+        sanity_plot(out, done[len(done) // 2], out / "sanity.png")
+    print(f"\n{len(done)}/{len(months)} months downloaded; {len(failed)} with problems")
+    for tag, problems in sorted(failed.items()):
+        print(f"  {tag}: {'; '.join(problems)}")
+    print(
+        "rerun the same command to retry, then add --consolidate"
+        if failed or len(done) < len(months)
+        else "all months downloaded: rerun with --consolidate"
+    )
     return 1 if failed else 0
 
 

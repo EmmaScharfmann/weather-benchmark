@@ -1,26 +1,9 @@
-"""
-Steps 7-8: AIFS-ENS vs AIFS-ENS + downscaler, at the Météo-France stations.
+"""Compare the coarse ensemble with its downscaled version at station locations.
 
-    uv run python scripts/eval_downscaled.py \
-        --forecasts outputs/france_aug2025/aifs-ens1.0_*.zarr \
-        --downscaled outputs/downscaled_aug2025/aifs-ens1.0_*.zarr \
-        --region france --cache outputs/cache/stations --out outputs/eval_aug2025
+Usage::
 
-Runs in the BASE environment (no torch needed: step 6 already produced the
-downscaled fields).
+    python scripts/eval_downscaled.py --config config.yaml
 
-Compared, at every station and forecast hour:
-    aifs             the raw 0.25 deg ensemble, read at the station (bilinear)
-    aifs_downscaled  the downscaled ensemble: each AIFS member x `sample` maps,
-                     read at the station from the 5.5 km grid
-    aifs_on_grid     the raw field after interpolation to the 5.5 km grid, read
-                     the same way as aifs_downscaled (should ~equal `aifs`: a
-                     check that the two reading paths agree)
-
-Scores: RMSE/bias of the ensemble mean, fair CRPS, spread-skill ratio, by lead
-time, valid hour and station elevation, with block-bootstrap intervals over
-initialisations; Brier score and hit/false-alarm rates for heat thresholds.
-Outputs: tables (CSV), scorecard.png, heatwave_map.png, summary.json.
 """
 
 from __future__ import annotations
@@ -30,233 +13,430 @@ import json
 import logging
 import sys
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 import pandas as pd
 import xarray as xr
 
-from weather_pipeline import station_interp as si
-from weather_pipeline import station_scoring as ss
-from weather_pipeline.regions import parse_region
-from weather_pipeline.stations import MeteoFranceHourly, load_stations
+from downscale import station_interp as si
+from downscale import station_scoring as ss
+from downscale.config import load_config
+from downscale.constants import SCORING_REGIONS, elevation_edges
+from downscale.stations import MeteoFranceHourly, QCConfig, load_stations
 
 logger = logging.getLogger("eval")
-METHODS = ["aifs", "aifs_downscaled", "aifs_on_grid"]
-THRESHOLDS_C = [30.0, 35.0]
+
+METHODS = ["coarse", "downscaled", "coarse_on_fine_grid"]
+LABELS = {"coarse": "coarse ensemble", "downscaled": "coarse ensemble + downscaler"}
 
 
-# ---------------------------------------------------------------------------
-def at_stations(fc_path: Path, ds_path: Path, stations: xr.Dataset) -> xr.Dataset:
-    fc = xr.open_zarr(fc_path)["t2m"]
-    if "ensemble" not in fc.dims:
-        fc = fc.expand_dims(ensemble=[0])
-    fc = fc.transpose("time", "lead_time", "ensemble", "lat", "lon").load().rename({"time": "init_time"})
-    raw = si.interpolator_for(fc, stations).apply(fc).drop_vars("ensemble")             # (init, lead, ens, station)
+def at_stations(forecast_path: Path, downscaled_path: Path, stations: xr.Dataset, variable: str) -> xr.Dataset:
+    """Read both forecasts at the station locations.
 
-    d = xr.open_zarr(ds_path)
-    if not np.array_equal(d["time"].values, fc["init_time"].values) or not np.array_equal(d["lead_time"].values, fc["lead_time"].values):
-        raise ValueError(f"{ds_path.name}: init/lead times differ from {fc_path.name}")
-    ci = si.curvilinear_for(d["lat"].values, d["lon"].values, stations, k=4)
-    if not ci.inside.all():
-        logger.warning("%d station(s) further than 15 km from any CERRA cell -> NaN", int((~ci.inside).sum()))
-    dsc = ci.apply(d["t2m_ds"].load().rename({"time": "init_time"}))                        # (init, lead, ens, sample, station)
-    dsc = dsc.stack(member=("ensemble", "sample")).transpose("init_time", "lead_time", "member", "station")
-    # its own dimension name: sharing "ensemble" with the 10-member raw forecast
-    # would make xarray pad the raw one with NaN members (the scorer accepts any
-    # dimension named ensemble*)
-    dsc = dsc.drop_vars(["member", "ensemble", "sample"]).rename({"member": "ensemble_ds"})
-    grid = ci.apply(d["t2m_interp"].load().rename({"time": "init_time"})).drop_vars("ensemble")   # (init, lead, ens, station)
+    :param forecast_path: Coarse forecast store.
+    :type forecast_path: pathlib.Path
+    :param downscaled_path: Matching downscaled store.
+    :type downscaled_path: pathlib.Path
+    :param stations: Station dataset.
+    :type stations: xarray.Dataset
+    :param variable: Variable to read from the coarse forecast.
+    :type variable: str
+    :returns: Dataset with one variable per method over ``(init_time, lead_time, ensemble*, station)``.
+    :rtype: xarray.Dataset
+    :raises ValueError: If the two stores disagree on times or member count.
+    """
+    forecast = xr.open_zarr(forecast_path)[variable]
+    if "ensemble" not in forecast.dims:
+        forecast = forecast.expand_dims(ensemble=[0])
+    forecast = forecast.transpose("time", "lead_time", "ensemble", "lat", "lon").load().rename({"time": "init_time"})
+    raw = si.interpolator_for(forecast, stations).apply(forecast).drop_vars("ensemble")
 
-    out = xr.Dataset({"aifs": raw, "aifs_downscaled": dsc, "aifs_on_grid": grid})
+    downscaled = xr.open_zarr(downscaled_path)
+    same_times = np.array_equal(downscaled["time"].values, forecast["init_time"].values) and np.array_equal(
+        downscaled["lead_time"].values, forecast["lead_time"].values
+    )
+    if not same_times:
+        raise ValueError(f"{downscaled_path.name}: times differ from {forecast_path.name}")
+    if downscaled.sizes["ensemble"] != forecast.sizes["ensemble"]:
+        raise ValueError(
+            f"{downscaled_path.name} holds {downscaled.sizes['ensemble']} members but "
+            f"{forecast_path.name} has {forecast.sizes['ensemble']}: the downscaled store is stale, "
+            "delete it and rerun downscale_forecasts.py"
+        )
+    if not Path(str(forecast_path).rstrip("/") + ".done").exists():
+        logger.warning("%s has no .done marker: the forecast run may be incomplete", forecast_path.name)
+
+    interp = si.curvilinear_for(downscaled["lat"].values, downscaled["lon"].values, stations, k=4)
+    if not interp.inside.all():
+        logger.warning("%d station(s) lie beyond the fine grid and become NaN", int((~interp.inside).sum()))
+    fine = interp.apply(downscaled["t2m_ds"].load().rename({"time": "init_time"}))
+    fine = fine.stack(member=("ensemble", "sample")).transpose("init_time", "lead_time", "member", "station")
+    fine = fine.drop_vars(["member", "ensemble", "sample"]).rename({"member": "ensemble_ds"})
+    on_fine_grid = interp.apply(downscaled["t2m_interp"].load().rename({"time": "init_time"})).drop_vars("ensemble")
+
+    out = xr.Dataset({"coarse": raw, "downscaled": fine, "coarse_on_fine_grid": on_fine_grid})
     out = out.assign_coords(station=stations["station"].values)
-    for c in ("latitude", "longitude", "elevation"):
-        out = out.assign_coords({c: ("station", stations[c].values)})
-    return out.assign_coords(valid_time=(("init_time", "lead_time"),
-                                         out["init_time"].values[:, None] + out["lead_time"].values[None, :]))
+    for coord in ("latitude", "longitude", "elevation"):
+        out = out.assign_coords({coord: ("station", stations[coord].values)})
+    return out.assign_coords(
+        valid_time=(
+            ("init_time", "lead_time"),
+            out["init_time"].values[:, None] + out["lead_time"].values[None, :],
+        )
+    )
 
 
-# ---------------------------------------------------------------------------
 class EventScores:
-    """Brier score and 50%-probability hit / false-alarm counts per lead and threshold."""
+    """Brier scores and hit rates for exceedance of fixed thresholds."""
 
-    def __init__(self, thresholds_K):
-        self.thr = thresholds_K
-        self.acc = {}       # (method, thr, lead_h) -> [sum (p-o)^2, n, hits, misses, false alarms, obs events]
+    def __init__(self, thresholds_k: Sequence[float]):
+        """
+        :param thresholds_k: Thresholds [K].
+        :type thresholds_k: collections.abc.Sequence[float]
+        """
+        self.thresholds = list(thresholds_k)
+        self.sums: dict[tuple[str, float, int], np.ndarray] = {}
 
-    def add(self, fc_st: xr.Dataset, obs: xr.DataArray, methods):
-        lead_h = (fc_st["lead_time"].values / np.timedelta64(1, "h")).astype(int)
-        o = obs.values                                                                   # (init, lead, station)
-        for m in methods:
-            f = fc_st[m].values                                                          # (init, lead, ens, station)
-            for t in self.thr:
-                p = (f >= t).mean(2)
-                ob = o >= t
-                for j, h in enumerate(lead_h):
-                    ok = np.isfinite(o[:, j]) & np.isfinite(p[:, j])
-                    pj, oj = p[:, j][ok], ob[:, j][ok]
-                    a = self.acc.setdefault((m, t, int(h)), np.zeros(6))
-                    a += [((pj - oj) ** 2).sum(), ok.sum(), ((pj >= .5) & oj).sum(), ((pj < .5) & oj).sum(),
-                          ((pj >= .5) & ~oj).sum(), oj.sum()]
+    def add(self, forecast_at_stations: xr.Dataset, obs: xr.DataArray, methods: Sequence[str]) -> None:
+        """Accumulate one initialisation.
+
+        :param forecast_at_stations: Forecasts read at stations.
+        :type forecast_at_stations: xarray.Dataset
+        :param obs: Observations over ``(init_time, lead_time, station)``.
+        :type obs: xarray.DataArray
+        :param methods: Method names to score.
+        :type methods: collections.abc.Sequence[str]
+        :returns: ``None``
+        :rtype: None
+        """
+        lead_hours = (forecast_at_stations["lead_time"].values / np.timedelta64(1, "h")).astype(int)
+        truth = obs.values
+        for method in methods:
+            values = forecast_at_stations[method].values
+            for threshold in self.thresholds:
+                probability = (values >= threshold).mean(2)
+                observed = truth >= threshold
+                for j, hour in enumerate(lead_hours):
+                    valid = np.isfinite(truth[:, j]) & np.isfinite(probability[:, j])
+                    p, o = probability[:, j][valid], observed[:, j][valid]
+                    entry = self.sums.setdefault((method, threshold, int(hour)), np.zeros(6))
+                    entry += [
+                        ((p - o) ** 2).sum(), valid.sum(), ((p >= 0.5) & o).sum(),
+                        ((p < 0.5) & o).sum(), ((p >= 0.5) & ~o).sum(), o.sum(),
+                    ]
 
     def table(self) -> pd.DataFrame:
+        """Turn the sums into a table.
+
+        :returns: One row per method, threshold and lead time.
+        :rtype: pandas.DataFrame
+        """
         rows = []
-        for (m, t, h), (b, n, hit, miss, fa, ev) in self.acc.items():
-            rows.append({"method": m, "threshold_C": round(t - 273.15, 1), "lead_h": h, "n": int(n),
-                         "obs_events": int(ev), "brier": b / n if n else np.nan,
-                         "hit_rate": hit / (hit + miss) if hit + miss else np.nan,
-                         "false_alarm_ratio": fa / (hit + fa) if hit + fa else np.nan})
+        for (method, threshold, hour), (brier, n, hits, misses, false_alarms, events) in self.sums.items():
+            rows.append({
+                "method": method, "threshold_C": round(threshold - 273.15, 1), "lead_h": hour,
+                "n": int(n), "obs_events": int(events),
+                "brier": brier / n if n else np.nan,
+                "hit_rate": hits / (hits + misses) if hits + misses else np.nan,
+                "false_alarm_ratio": false_alarms / (hits + false_alarms) if hits + false_alarms else np.nan,
+            })
         return pd.DataFrame(rows).sort_values(["threshold_C", "method", "lead_h"])
 
 
-# ---------------------------------------------------------------------------
-def run(fc_paths, ds_paths, region, cache_dir, out_dir, station_window=None, n_boot=200, provider=None):
-    out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
+def scorecard(results, binned, intervals, events, stations, edges, path: Path) -> None:
+    """Draw the four-panel scorecard.
+
+    :param results: Metrics per method over lead time.
+    :type results: dict[str, xarray.Dataset]
+    :param binned: Metrics per method, region and elevation band.
+    :type binned: dict[str, xarray.Dataset]
+    :param intervals: Bootstrap bounds per method, or ``None``.
+    :type intervals: dict | None
+    :param events: Event score table.
+    :type events: pandas.DataFrame
+    :param stations: Station dataset, for the per-band counts.
+    :type stations: xarray.Dataset
+    :param edges: Elevation band edges [m].
+    :type edges: numpy.ndarray
+    :param path: Destination image.
+    :type path: pathlib.Path
+    :returns: ``None``
+    :rtype: None
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    hours = lambda ds: ds["lead_time"].values / np.timedelta64(1, "h")
+    colour = {"coarse": "tab:blue", "downscaled": "tab:red"}
+    fig, ax = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
+    for metric, axis, title in (
+        ("rmse", ax[0, 0], "RMSE of the ensemble mean against stations (K)"),
+        ("crps", ax[0, 1], "fair CRPS against stations (K)"),
+    ):
+        for method in ("coarse", "downscaled"):
+            axis.plot(
+                hours(results[method]), results[method][metric].values,
+                color=colour[method], marker="o", ms=3, label=LABELS[method],
+            )
+            if intervals:
+                lower, upper = intervals[method]
+                axis.fill_between(
+                    hours(results[method]), lower[metric].values, upper[metric].values,
+                    color=colour[method], alpha=0.15,
+                )
+        axis.set_title(title)
+        axis.set_xlabel("lead time (h)")
+        axis.grid(alpha=0.3)
+    ax[0, 0].legend(fontsize=8)
+
+    (lat_min, lat_max), (lon_min, lon_max) = SCORING_REGIONS["france"]
+    in_box = (
+        (stations.latitude >= lat_min) & (stations.latitude <= lat_max)
+        & (stations.longitude >= lon_min) & (stations.longitude <= lon_max)
+    ).values
+    counts = [
+        int((in_box & (stations.elevation.values >= low) & (stations.elevation.values < high)).sum())
+        for low, high in zip(edges[:-1], edges[1:])
+    ]
+    for method in ("coarse", "downscaled"):
+        values = binned[method].rmse.sel(region="france").mean("lead_time")
+        ax[1, 0].plot(range(len(values)), values.values, marker="o", color=colour[method], label=LABELS[method])
+    ax[1, 0].set_xticks(range(len(counts)))
+    ax[1, 0].set_xticklabels(
+        [f"{int(low)}-{int(high)} m\nn={n}" for low, high, n in zip(edges[:-1], edges[1:], counts)], fontsize=7
+    )
+    ax[1, 0].set_title("RMSE by station elevation, averaged over lead times")
+    ax[1, 0].grid(alpha=0.3)
+    ax[1, 0].legend(fontsize=8)
+
+    hottest = events[events.threshold_C == events.threshold_C.max()]
+    for method in ("coarse", "downscaled"):
+        subset = hottest[hottest.method == method].sort_values("lead_h")
+        ax[1, 1].plot(subset.lead_h, subset.brier, color=colour[method], marker="o", ms=3, label=LABELS[method])
+    ax[1, 1].set_title(f"Brier score, station temperature at or above {hottest.threshold_C.max():.0f} degC")
+    ax[1, 1].set_xlabel("lead time (h)")
+    ax[1, 1].grid(alpha=0.3)
+    ax[1, 1].legend(fontsize=8)
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+
+
+def heatwave_map(peak, stations: xr.Dataset, variable: str, path: Path) -> None:
+    """Draw both forecasts at the hottest observed hour, with the observations.
+
+    :param peak: Tuple of the observed mean, the downscaled store and the lead index.
+    :type peak: tuple
+    :param stations: Station dataset.
+    :type stations: xarray.Dataset
+    :param variable: Observed variable name.
+    :type variable: str
+    :param path: Destination image.
+    :type path: pathlib.Path
+    :returns: ``None``
+    :rtype: None
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    _, downscaled_path, index = peak
+    ds = xr.open_zarr(downscaled_path)
+    valid = pd.Timestamp(ds["valid_time"].isel(time=0, lead_time=index).values)
+    coarse = ds["t2m_interp"].isel(time=0, lead_time=index).mean("ensemble").values - 273.15
+    fine = ds["t2m_ds"].isel(time=0, lead_time=index).mean(("ensemble", "sample")).values - 273.15
+    observed = stations[variable].sel(time=valid, method="nearest").values - 273.15
+    low, high = np.nanpercentile(
+        np.concatenate([fine.ravel(), observed[np.isfinite(observed)]]), [2, 98]
+    )
+    fig, ax = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=True)
+    for axis, (title, field) in zip(
+        ax, [("coarse ensemble mean, interpolated", coarse), ("downscaled ensemble mean", fine)]
+    ):
+        mesh = axis.pcolormesh(ds.lon, ds.lat, field, cmap="RdYlBu_r", vmin=low, vmax=high, shading="auto")
+        axis.scatter(
+            stations.longitude, stations.latitude, c=observed, cmap="RdYlBu_r",
+            vmin=low, vmax=high, s=9, edgecolors="k", linewidths=0.2,
+        )
+        axis.set_title(f"{title}\n(dots: station observations)")
+        axis.set_aspect(1 / np.cos(np.deg2rad(float(np.mean(ds.lat.values)))))
+        fig.colorbar(mesh, ax=axis, label="degC")
+    lead_hours = int(ds.lead_time.values[index] / np.timedelta64(1, "h"))
+    fig.suptitle(
+        f"valid {valid:%Y-%m-%d %H} UTC, initialised "
+        f"{pd.Timestamp(ds.time.values[0]):%Y-%m-%d} (+{lead_hours} h)"
+    )
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+
+
+def run(cfg, forecast_paths, downscaled_paths, out_dir, provider=None) -> dict:
+    """Score both forecasts and write the tables and figures.
+
+    :param cfg: Pipeline configuration.
+    :type cfg: weather_pipeline.config.Config
+    :param forecast_paths: Coarse forecast stores.
+    :type forecast_paths: collections.abc.Sequence[str]
+    :param downscaled_paths: Matching downscaled stores.
+    :type downscaled_paths: collections.abc.Sequence[str]
+    :param out_dir: Output directory.
+    :type out_dir: str | pathlib.Path
+    :param provider: Station provider; ``None`` builds the configured one.
+    :type provider: weather_pipeline.stations.StationProvider | None
+    :returns: Summary of the comparison, also written to ``summary.json``.
+    :rtype: dict
+    :raises FileNotFoundError: If a forecast has no matching downscaled store.
+    """
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    variable = cfg.coarse.variable
     pairs = []
-    for f in sorted(fc_paths):
-        match = [d for d in ds_paths if Path(d).name == Path(f).name]
-        if not match:
-            raise FileNotFoundError(f"no downscaled file named {Path(f).name} among --downscaled")
-        pairs.append((Path(f), Path(match[0])))
-    ref = xr.open_zarr(pairs[0][0])
+    for forecast in sorted(forecast_paths):
+        matches = [d for d in downscaled_paths if Path(d).name == Path(forecast).name]
+        if not matches:
+            raise FileNotFoundError(f"no downscaled store named {Path(forecast).name}")
+        pairs.append((Path(forecast), Path(matches[0])))
+
+    reference = xr.open_zarr(pairs[0][0])
     inits = pd.DatetimeIndex([xr.open_zarr(f).time.values[0] for f, _ in pairs])
-    start = inits.min().floor("h"); end = (inits.max() + pd.Timedelta(ref.lead_time.values[-1])).floor("h")
-    if station_window:
-        start, end = (pd.Timestamp(x) for x in station_window)
-    stations, _ = load_stations(provider or MeteoFranceHourly(), region, start, end, variables=["t2m"], cache_dir=cache_dir)
-    logger.info("%d stations, %d initialisations, window %s .. %s", stations.sizes["station"], len(pairs), start, end)
+    start = inits.min().floor("h")
+    end = (inits.max() + pd.Timedelta(reference.lead_time.values[-1])).floor("h")
+    if cfg.stations.window:
+        start, end = (pd.Timestamp(x) for x in cfg.stations.window)
+    stations, _ = load_stations(
+        provider or MeteoFranceHourly(), cfg.region_box, start, end,
+        variables=cfg.stations.variables, cache_dir=cfg.paths.stations_cache,
+        qc=QCConfig(min_completeness=cfg.stations.min_completeness, primary=cfg.stations.variables[0]),
+        holdout_frac=cfg.stations.holdout_frac, active=cfg.stations.active,
+        include_unknown_start=cfg.stations.include_unknown_start,
+    )
+    logger.info(
+        "%d stations, %d initialisations, window %s .. %s", stations.sizes["station"], len(pairs), start, end
+    )
 
-    cases_all, cases_bin, events = [], [], EventScores([t + 273.15 for t in THRESHOLDS_C])
+    edges = elevation_edges(cfg.evaluation.elevation_edges)
+    bins = ss.default_bins(edges=cfg.evaluation.elevation_edges)
+    thresholds = [t + 273.15 for t in cfg.evaluation.heat_thresholds_c]
+    cases_all, cases_binned, events = [], [], EventScores(thresholds)
     peak = None
-    for f, d in pairs:
-        fc_st = at_stations(f, d, stations)
-        obs = si.observations_at_valid_times(fc_st, stations, "t2m")
-        if peak is None:                       # consistency check on the first init
-            diff = (fc_st["aifs_on_grid"] - fc_st["aifs"]).values
-            logger.info("reading-path check: |aifs_on_grid - aifs| mean %.2f K, 95th pct %.2f K (should be small)",
-                        np.nanmean(np.abs(diff)), np.nanpercentile(np.abs(diff), 95))
-        cases_all.append(ss.score_station_case(fc_st, obs, "t2m", methods=METHODS, bin_by=None))
-        cases_bin.append(ss.score_station_case(fc_st, obs, "t2m", methods=METHODS, bin_by="default"))
-        events.add(fc_st, obs, ["aifs", "aifs_downscaled"])
-        hot = np.nanmean(obs.values, axis=2)                                            # (init, lead) station-mean obs
-        j = np.unravel_index(np.nanargmax(hot), hot.shape)
-        if peak is None or hot[j] > peak[0]:
-            peak = (hot[j], f, d, int(j[1]))
-        logger.info("scored %s", f.name)
+    for forecast_path, downscaled_path in pairs:
+        at = at_stations(forecast_path, downscaled_path, stations, variable)
+        obs = si.observations_at_valid_times(at, stations, cfg.stations.variables[0])
+        if peak is None:
+            difference = (at["coarse_on_fine_grid"] - at["coarse"]).values
+            logger.info(
+                "reading-path check: mean absolute difference %.2f K, 95th percentile %.2f K",
+                np.nanmean(np.abs(difference)), np.nanpercentile(np.abs(difference), 95),
+            )
+        cases_all.append(
+            ss.score_station_case(
+                at, obs, variable, methods=METHODS, bin_by=None,
+                density_alpha_deg=cfg.evaluation.density_alpha_deg,
+            )
+        )
+        cases_binned.append(
+            ss.score_station_case(
+                at, obs, variable, methods=METHODS, bin_by=bins,
+                density_alpha_deg=cfg.evaluation.density_alpha_deg,
+            )
+        )
+        events.add(at, obs, ["coarse", "downscaled"])
+        observed_mean = np.nanmean(obs.values, axis=2)
+        hottest = np.unravel_index(np.nanargmax(observed_mean), observed_mean.shape)
+        if peak is None or observed_mean[hottest] > peak[0]:
+            peak = (observed_mean[hottest], downscaled_path, int(hottest[1]))
+        logger.info("scored %s", forecast_path.name)
 
-    res, resb = ss.combine_cases(cases_all), ss.combine_cases(cases_bin)
-    ci = {m: ss.bootstrap_ci(cases_all, m, n_boot=n_boot) for m in ("aifs", "aifs_downscaled")} if len(cases_all) >= 3 else None
+    results, binned = ss.combine_cases(cases_all), ss.combine_cases(cases_binned)
+    intervals = (
+        {
+            m: ss.bootstrap_ci(
+                cases_all, m, n_boot=cfg.evaluation.n_bootstrap, block=cfg.evaluation.bootstrap_block
+            )
+            for m in ("coarse", "downscaled")
+        }
+        if len(cases_all) >= 3 else None
+    )
 
-    # -- tables -------------------------------------------------------------------
-    by_lead = pd.concat({m: res[m].to_dataframe() for m in METHODS}, names=["method"]).reset_index()
+    by_lead = pd.concat({m: results[m].to_dataframe() for m in METHODS}, names=["method"]).reset_index()
     by_lead["lead_h"] = (pd.to_timedelta(by_lead.pop("lead_time")).dt.total_seconds() / 3600).astype(int)
     by_lead["valid_hour"] = (by_lead["lead_h"] + inits[0].hour) % 24 if inits.hour.nunique() == 1 else np.nan
     by_lead.to_csv(out / "by_lead.csv", index=False)
-    binned = pd.concat({m: resb[m].to_dataframe() for m in METHODS}, names=["method"]).reset_index()
-    binned.to_csv(out / "by_region_elevation.csv", index=False)
-    ev = events.table(); ev.to_csv(out / "heat_events.csv", index=False)
+    pd.concat({m: binned[m].to_dataframe() for m in METHODS}, names=["method"]).reset_index().to_csv(
+        out / "by_region_elevation.csv", index=False
+    )
+    event_table = events.table()
+    event_table.to_csv(out / "heat_events.csv", index=False)
 
-    a, b = res["aifs"], res["aifs_downscaled"]
-    summary = {"n_inits": len(pairs), "n_stations": int(stations.sizes["station"]),
-               "members": {"aifs": int(xr.open_zarr(pairs[0][0]).sizes.get("ensemble", 1)),
-                           "aifs_downscaled": int(xr.open_zarr(pairs[0][1]).sizes["ensemble"] * xr.open_zarr(pairs[0][1]).sizes["sample"])},
-               "rmse_K": {"aifs": float(a.rmse.mean()), "aifs_downscaled": float(b.rmse.mean())},
-               "crps_K": {"aifs": float(a.crps.mean()), "aifs_downscaled": float(b.crps.mean())},
-               "bias_K": {"aifs": float(a.bias.mean()), "aifs_downscaled": float(b.bias.mean())},
-               "ssr": {"aifs": float(a.ssr.mean()), "aifs_downscaled": float(b.ssr.mean())}}
-    summary["rmse_change_pct"] = 100 * (summary["rmse_K"]["aifs_downscaled"] / summary["rmse_K"]["aifs"] - 1)
-    summary["crps_change_pct"] = 100 * (summary["crps_K"]["aifs_downscaled"] / summary["crps_K"]["aifs"] - 1)
+    coarse_scores, fine_scores = results["coarse"], results["downscaled"]
+    first_downscaled = xr.open_zarr(pairs[0][1])
+    summary = {
+        "n_inits": len(pairs),
+        "n_stations": int(stations.sizes["station"]),
+        "members": {
+            "coarse": int(xr.open_zarr(pairs[0][0]).sizes.get("ensemble", 1)),
+            "downscaled": int(first_downscaled.sizes["ensemble"] * first_downscaled.sizes["sample"]),
+        },
+        "rmse_K": {"coarse": float(coarse_scores.rmse.mean()), "downscaled": float(fine_scores.rmse.mean())},
+        "crps_K": {"coarse": float(coarse_scores.crps.mean()), "downscaled": float(fine_scores.crps.mean())},
+        "bias_K": {"coarse": float(coarse_scores.bias.mean()), "downscaled": float(fine_scores.bias.mean())},
+        "ssr": {"coarse": float(coarse_scores.ssr.mean()), "downscaled": float(fine_scores.ssr.mean())},
+    }
+    summary["rmse_change_pct"] = 100 * (summary["rmse_K"]["downscaled"] / summary["rmse_K"]["coarse"] - 1)
+    summary["crps_change_pct"] = 100 * (summary["crps_K"]["downscaled"] / summary["crps_K"]["coarse"] - 1)
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
 
     pd.set_option("display.width", 160)
-    show = [h for h in (6, 24, 48, 96, 240) if h in by_lead.lead_h.values]
-    print("\nAIFS-ENS vs AIFS-ENS + downscaler, all stations, density-weighted (K)")
+    shown = [h for h in cfg.evaluation.lead_hours_shown if h in by_lead.lead_h.values]
+    print("\ncoarse ensemble against coarse ensemble plus downscaler, all stations (K)")
     for metric in ("rmse", "crps", "ssr"):
-        t = by_lead.pivot(index="lead_h", columns="method", values=metric).loc[show, ["aifs", "aifs_downscaled"]]
-        print(f"\n{metric.upper()}\n{t.round(3).to_string()}")
-    fr = binned[binned.region == "france"].groupby(["method", "elevation"]).rmse.mean().unstack(0)[["aifs", "aifs_downscaled"]]
-    print(f"\nRMSE by station elevation band (lower edge, m), mean over leads\n{fr.round(2).to_string()}")
-    e35 = ev[ev.threshold_C == 35].pivot(index="lead_h", columns="method", values="brier")
-    if not e35.empty:
-        print(f"\nBrier score, afternoon >= 35 °C (lower is better)\n{e35.loc[[h for h in show if h in e35.index]].round(3).to_string()}")
-    print(f"\nOverall: RMSE {summary['rmse_K']['aifs']:.2f} -> {summary['rmse_K']['aifs_downscaled']:.2f} K "
-          f"({summary['rmse_change_pct']:+.0f}%), CRPS {summary['crps_K']['aifs']:.2f} -> {summary['crps_K']['aifs_downscaled']:.2f} K "
-          f"({summary['crps_change_pct']:+.0f}%), SSR {summary['ssr']['aifs']:.2f} -> {summary['ssr']['aifs_downscaled']:.2f}")
+        table = by_lead.pivot(index="lead_h", columns="method", values=metric)
+        print(f"\n{metric.upper()}\n{table.loc[shown, ['coarse', 'downscaled']].round(3).to_string()}")
+    print(
+        f"\noverall: RMSE {summary['rmse_K']['coarse']:.2f} -> {summary['rmse_K']['downscaled']:.2f} K "
+        f"({summary['rmse_change_pct']:+.0f}%), CRPS {summary['crps_K']['coarse']:.2f} -> "
+        f"{summary['crps_K']['downscaled']:.2f} K ({summary['crps_change_pct']:+.0f}%), "
+        f"SSR {summary['ssr']['coarse']:.2f} -> {summary['ssr']['downscaled']:.2f}"
+    )
 
-    _scorecard(res, resb, ci, ev, stations, out / "scorecard.png")
-    _heatwave_map(peak, stations, out / "heatwave_map.png")
+    scorecard(results, binned, intervals, event_table, stations, edges, out / "scorecard.png")
+    heatwave_map(peak, stations, cfg.stations.variables[0], out / "heatwave_map.png")
     print(f"\nwrote {out}/")
     return summary
 
 
-def _scorecard(res, resb, ci, ev, stations, path):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    hrs = lambda d: d["lead_time"].values / np.timedelta64(1, "h")
-    col = {"aifs": "tab:blue", "aifs_downscaled": "tab:red"}
-    lab = {"aifs": "AIFS-ENS", "aifs_downscaled": "AIFS-ENS + downscaler"}
-    fig, ax = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
-    for metric, a, title in (("rmse", ax[0, 0], "RMSE of ensemble mean vs stations (K)"), ("crps", ax[0, 1], "fair CRPS vs stations (K)")):
-        for m in ("aifs", "aifs_downscaled"):
-            a.plot(hrs(res[m]), res[m][metric].values, color=col[m], marker="o", ms=3, label=lab[m])
-            if ci:
-                lo, hi = ci[m]; a.fill_between(hrs(res[m]), lo[metric].values, hi[metric].values, color=col[m], alpha=.15)
-        a.set_title(title); a.set_xlabel("lead time (h)"); a.grid(alpha=.3)
-    ax[0, 0].legend(fontsize=8)
-    edges = ss.ELEVATION_EDGES
-    (la0, la1), (lo0, lo1) = ss.FRANCE_REGIONS["france"]
-    inbox = ((stations.latitude >= la0) & (stations.latitude <= la1) & (stations.longitude >= lo0) & (stations.longitude <= lo1)).values
-    counts = [int((inbox & (stations.elevation.values >= lo) & (stations.elevation.values < hi)).sum()) for lo, hi in zip(edges[:-1], edges[1:])]
-    for m in ("aifs", "aifs_downscaled"):
-        d = resb[m].rmse.sel(region="france").mean("lead_time")
-        ax[1, 0].plot(range(len(d)), d.values, marker="o", color=col[m], label=lab[m])
-    ax[1, 0].set_xticks(range(len(counts))); ax[1, 0].set_xticklabels([f"{int(lo)}-{int(hi)} m\nn={n}" for lo, hi, n in zip(edges[:-1], edges[1:], counts)], fontsize=7)
-    ax[1, 0].set_title("RMSE by station elevation (mean over leads)"); ax[1, 0].grid(alpha=.3); ax[1, 0].legend(fontsize=8)
-    e = ev[ev.threshold_C == 35]
-    for m in ("aifs", "aifs_downscaled"):
-        d = e[e.method == m].sort_values("lead_h")
-        ax[1, 1].plot(d.lead_h, d.brier, color=col[m], marker="o", ms=3, label=lab[m])
-    ax[1, 1].set_title("Brier score, station temperature >= 35 °C (lower = better)"); ax[1, 1].set_xlabel("lead time (h)")
-    ax[1, 1].grid(alpha=.3); ax[1, 1].legend(fontsize=8)
-    fig.savefig(path, dpi=130); plt.close(fig)
+def main(argv: Sequence[str] | None = None) -> int:
+    """Command-line entry point.
 
-
-def _heatwave_map(peak, stations, path):
-    """For the hottest observed forecast hour: AIFS interpolated vs downscaled mean, with the stations' observations."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    _, f, d, j = peak
-    ds = xr.open_zarr(d)
-    vt = pd.Timestamp(ds["valid_time"].isel(time=0, lead_time=j).values)
-    interp = ds["t2m_interp"].isel(time=0, lead_time=j).mean("ensemble").values - 273.15
-    fine = ds["t2m_ds"].isel(time=0, lead_time=j).mean(("ensemble", "sample")).values - 273.15
-    obs = stations["t2m"].sel(time=vt, method="nearest").values - 273.15
-    lo, hi = np.nanpercentile(np.concatenate([fine.ravel(), obs[np.isfinite(obs)]]), [2, 98])
-    fig, ax = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=True)
-    for a, (t, fld) in zip(ax, [("AIFS-ENS mean, interpolated", interp), ("AIFS-ENS + downscaler, mean", fine)]):
-        m = a.pcolormesh(ds.lon, ds.lat, fld, cmap="RdYlBu_r", vmin=lo, vmax=hi, shading="auto")
-        a.scatter(stations.longitude, stations.latitude, c=obs, cmap="RdYlBu_r", vmin=lo, vmax=hi, s=9, edgecolors="k", linewidths=.2)
-        a.set_title(f"{t}\n(dots: station observations)"); a.set_aspect(1 / np.cos(np.deg2rad(46)))
-        fig.colorbar(m, ax=a, label="°C")
-    fig.suptitle(f"valid {vt:%Y-%m-%d %H} UTC, init {pd.Timestamp(ds.time.values[0]):%Y-%m-%d} (+{int(ds.lead_time.values[j] / np.timedelta64(1, 'h'))} h)")
-    fig.savefig(path, dpi=110); plt.close(fig)
-
-
-def main(argv=None) -> int:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--forecasts", nargs="+", required=True)
-    p.add_argument("--downscaled", nargs="+", required=True)
-    p.add_argument("--region", default="france")
-    p.add_argument("--cache", default="outputs/cache/stations")
-    p.add_argument("--out", default="outputs/eval")
-    p.add_argument("--station-window", default=None, metavar="START,END")
-    p.add_argument("--n-boot", type=int, default=200)
-    a = p.parse_args(argv)
+    :param argv: Argument list; ``None`` reads ``sys.argv``.
+    :type argv: collections.abc.Sequence[str] | None
+    :returns: Exit status.
+    :rtype: int
+    """
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--config", default=None)
+    parser.add_argument("--forecasts", nargs="+", default=None, help="overrides paths.forecasts")
+    parser.add_argument("--downscaled", nargs="+", default=None, help="overrides paths.downscaled")
+    parser.add_argument("--out", default=None, help="overrides paths.evaluation")
+    parser.add_argument("--station-window", default=None, metavar="START,END")
+    parser.add_argument("--n-bootstrap", type=int, default=None)
+    args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     logging.getLogger("wetterdienst").setLevel(logging.WARNING)
-    run(a.forecasts, a.downscaled, parse_region(a.region), a.cache, a.out,
-        station_window=a.station_window.split(",") if a.station_window else None, n_boot=a.n_boot)
+
+    cfg = load_config(args.config)
+    if args.station_window:
+        cfg.stations.window = args.station_window.split(",")
+    if args.n_bootstrap is not None:
+        cfg.evaluation.n_bootstrap = args.n_bootstrap
+    forecasts = args.forecasts or sorted(str(p) for p in Path(cfg.paths.forecasts).glob("*.zarr"))
+    downscaled = args.downscaled or sorted(str(p) for p in Path(cfg.paths.downscaled).glob("*.zarr"))
+    if not forecasts or not downscaled:
+        parser.error("no forecasts or downscaled stores found; pass the paths or set them in the configuration")
+    run(cfg, forecasts, downscaled, args.out or cfg.paths.evaluation)
     return 0
 
 

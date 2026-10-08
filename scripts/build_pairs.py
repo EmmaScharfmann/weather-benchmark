@@ -1,24 +1,13 @@
-"""
-Step 2: training pairs for the downscaler -- ERA5 2 m temperature placed on the
-CERRA grid (input) next to CERRA 2 m temperature (target), over France.
+"""Build coarse - fine training pairs for the downscaler.
 
-    uv run python scripts/build_pairs.py --cerra data/cerra --out data/pairs --years 2014 2020
-    # rerun any time: finished months are skipped, months whose CERRA file is
-    # not downloaded yet are listed as pending
-    uv run python scripts/build_pairs.py --cerra data/cerra --out data/pairs --years 2014 2020 --consolidate
+The coarse source is interpolated onto the target grid, so the model sees input
+and target pixel by pixel.
 
-Per month (data/pairs/months/pairs_YYYYMM.zarr), dims (time, y, x):
-    era5_t2m   ERA5 2 m temperature, bilinearly interpolated onto the CERRA grid  [K]
-    cerra_t2m  CERRA 2 m temperature (the target)                                   [K]
-Static (data/pairs/static.zarr), dims (y, x):
-    cerra_orography, land_sea_mask        fine-scale terrain from CERRA
-    era5_orography                        ERA5 surface height on the CERRA grid [m]
---consolidate merges the months into data/pairs/pairs_france.zarr, computes
-normalisation statistics on the TRAINING years only (stats.json), and draws
-check.png for one heatwave-like time step.
+Usage::
 
-The bilinear ERA5 field is both the model's main input and the "coarse model
-alone" baseline that the downscaler has to beat.
+    python scripts/build_pairs.py --config config.yaml
+    python scripts/build_pairs.py --config config.yaml --consolidate
+
 """
 
 from __future__ import annotations
@@ -30,249 +19,423 @@ import shutil
 import sys
 import time
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 import pandas as pd
 import xarray as xr
 
-from weather_pipeline.regions import crop_indices
-from weather_pipeline.station_interp import G, GridInterpolator
+from downscale.config import Config, load_config
+from downscale.constants import COARSE_CROP_MARGIN_DEG, G
+from downscale.regions import crop_indices
+from downscale.station_interp import GridInterpolator
 
 logger = logging.getLogger("pairs")
-MARGIN_DEG = 1.5      # ERA5 crop margin around the CERRA box, so interpolation never hits an edge
 
 
-# ---------------------------------------------------------------------------
-# ERA5 side
-# ---------------------------------------------------------------------------
-class Era5OnCerra:
-    """Fetches ERA5 t2m, crops it to the CERRA box (+ margin) as soon as it
-    arrives, and interpolates it onto the CERRA grid points."""
+class CoarseOnTargetGrid:
+    """Fetches a coarse field and interpolates it onto the target grid."""
 
-    def __init__(self, source, cerra_lat: np.ndarray, cerra_lon: np.ndarray, batch: int = 28):
-        self.source, self.batch = source, batch
-        self.shape = cerra_lat.shape
-        la, lo = cerra_lat.ravel(), cerra_lon.ravel()
-        self.box = (float(la.min()) - MARGIN_DEG, float(la.max()) + MARGIN_DEG,
-                    float(lo.min()) - MARGIN_DEG, float(lo.max()) + MARGIN_DEG)
-        self.points = (la, lo)
-        self._interp = None
-        self._idx = None
+    def __init__(self, source, target_lat: np.ndarray, target_lon: np.ndarray, variable: str, batch: int = 28):
+        """
+        :param source: Callable taking ``(times, variables)`` and returning ``(time, variable, lat, lon)``.
+        :type source: typing.Callable
+        :param target_lat: Target grid latitudes with shape ``(y, x)``.
+        :type target_lat: numpy.ndarray
+        :param target_lon: Target grid longitudes with shape ``(y, x)``.
+        :type target_lon: numpy.ndarray
+        :param variable: Variable name to request.
+        :type variable: str
+        :param batch: Time steps per request.
+        :type batch: int
+        """
+        self.source, self.variable, self.batch = source, variable, batch
+        self.shape = target_lat.shape
+        lat, lon = target_lat.ravel(), target_lon.ravel()
+        self.box = (
+            float(lat.min()) - COARSE_CROP_MARGIN_DEG, float(lat.max()) + COARSE_CROP_MARGIN_DEG,
+            float(lon.min()) - COARSE_CROP_MARGIN_DEG, float(lon.max()) + COARSE_CROP_MARGIN_DEG,
+        )
+        self.points = (lat, lon)
+        self._interp: GridInterpolator | None = None
+        self._crop_idx: tuple[np.ndarray, np.ndarray] | None = None
 
     def _crop(self, da: xr.DataArray) -> xr.DataArray:
-        if self._idx is None:
-            self._idx = crop_indices(self.box, da["lat"].values, da["lon"].values)
-        return da.isel(lat=self._idx[0], lon=self._idx[1])
+        """Cut a global field down to the target box plus a margin.
 
-    def _to_cerra(self, da: xr.DataArray) -> np.ndarray:
+        :param da: Field with ``lat`` and ``lon`` coordinates.
+        :type da: xarray.DataArray
+        :returns: Cropped field.
+        :rtype: xarray.DataArray
+        """
+        if self._crop_idx is None:
+            self._crop_idx = crop_indices(self.box, da["lat"].values, da["lon"].values)
+        return da.isel(lat=self._crop_idx[0], lon=self._crop_idx[1])
+
+    def _to_target(self, da: xr.DataArray) -> np.ndarray:
+        """Interpolate a cropped field onto the target grid.
+
+        :param da: Cropped field.
+        :type da: xarray.DataArray
+        :returns: Values reshaped onto ``(..., y, x)``.
+        :rtype: numpy.ndarray
+        :raises ValueError: If any target point falls outside the cropped field.
+        """
         if self._interp is None:
             self._interp = GridInterpolator.build(da["lat"].values, da["lon"].values, *self.points)
             if not self._interp.inside.all():
-                raise ValueError("some CERRA points fall outside the ERA5 crop; increase MARGIN_DEG")
-        out = self._interp.apply(da)                       # (..., station)
+                raise ValueError("some target points fall outside the coarse crop; increase the margin")
+        out = self._interp.apply(da)
         return out.values.reshape(*out.shape[:-1], *self.shape)
 
-    def t2m(self, times) -> np.ndarray:
+    def field(self, times) -> np.ndarray:
+        """Fetch and interpolate the configured variable.
+
+        :param times: Times to fetch.
+        :type times: collections.abc.Sequence
+        :returns: Values of shape ``(time, y, x)``.
+        :rtype: numpy.ndarray
+        """
         times = pd.DatetimeIndex(times)
         parts = []
         for i in range(0, times.size, self.batch):
-            da = self.source(list(times[i:i + self.batch]), ["t2m"]).sel(variable="t2m", drop=True)
-            parts.append(self._to_cerra(self._crop(da)))
+            da = self.source(list(times[i:i + self.batch]), [self.variable]).sel(variable=self.variable, drop=True)
+            parts.append(self._to_target(self._crop(da)))
         return np.concatenate(parts, axis=0).astype("f4")
 
-    def static_height(self, z_geopotential: xr.DataArray) -> np.ndarray:
-        return self._to_cerra(self._crop(z_geopotential / G)).astype("f4")
+    def surface_height(self, geopotential: xr.DataArray) -> np.ndarray:
+        """Interpolate the coarse surface height onto the target grid.
+
+        :param geopotential: Surface geopotential [m^2 s^-2].
+        :type geopotential: xarray.DataArray
+        :returns: Surface height [m] of shape ``(y, x)``.
+        :rtype: numpy.ndarray
+        """
+        return self._to_target(self._crop(geopotential / G)).astype("f4")
 
 
-# ---------------------------------------------------------------------------
-# months
-# ---------------------------------------------------------------------------
-def _clean(ds):
-    for v in ds.variables.values():
-        v.encoding.clear()
+def _clean(ds: xr.Dataset) -> xr.Dataset:
+    """Strip encodings before writing.
+
+    :param ds: Dataset to clean.
+    :type ds: xarray.Dataset
+    :returns: The same dataset, modified in place.
+    :rtype: xarray.Dataset
+    """
+    for variable in ds.variables.values():
+        variable.encoding.clear()
     return ds
 
 
-def month_checks(era5: np.ndarray, cerra: np.ndarray) -> dict:
-    ok = np.isfinite(era5) & np.isfinite(cerra)
-    d = (cerra - era5)[ok]
-    corr = float(np.corrcoef(era5[ok], cerra[ok])[0, 1]) if ok.sum() > 2 else float("nan")
-    return {"nan_era5": int((~np.isfinite(era5)).sum()), "nan_cerra": int((~np.isfinite(cerra)).sum()),
-            "corr": round(corr, 4), "mean_diff_K": round(float(d.mean()), 3), "rmse_K": round(float(np.sqrt((d ** 2).mean())), 3)}
+def month_checks(coarse: np.ndarray, fine: np.ndarray) -> dict:
+    """Summarise the agreement between a coarse and a fine field.
+
+    :param coarse: Interpolated coarse field [K].
+    :type coarse: numpy.ndarray
+    :param fine: Target field [K].
+    :type fine: numpy.ndarray
+    :returns: Counts of missing values, correlation, mean difference and RMSE.
+    :rtype: dict
+    """
+    valid = np.isfinite(coarse) & np.isfinite(fine)
+    difference = (fine - coarse)[valid]
+    correlation = float(np.corrcoef(coarse[valid], fine[valid])[0, 1]) if valid.sum() > 2 else float("nan")
+    return {
+        "nan_coarse": int((~np.isfinite(coarse)).sum()),
+        "nan_fine": int((~np.isfinite(fine)).sum()),
+        "corr": round(correlation, 4),
+        "mean_diff_K": round(float(difference.mean()), 3),
+        "rmse_K": round(float(np.sqrt((difference ** 2).mean())), 3),
+    }
 
 
-def do_month(cerra_dir: Path, out: Path, tag: str, e2c: Era5OnCerra, static_lat, static_lon) -> dict | None:
+def do_month(
+    target_dir: Path, out: Path, tag: str, coarse: CoarseOnTargetGrid,
+    lat: np.ndarray, lon: np.ndarray,
+) -> dict | None:
+    """Pair one month of target data with the coarse source.
+
+    :param target_dir: Directory holding the downloaded target months.
+    :type target_dir: pathlib.Path
+    :param out: Output directory.
+    :type out: pathlib.Path
+    :param tag: Month tag such as ``"201407"``.
+    :type tag: str
+    :param coarse: Coarse source bound to the target grid.
+    :type coarse: CoarseOnTargetGrid
+    :param lat: Target grid latitudes with shape ``(y, x)``.
+    :type lat: numpy.ndarray
+    :param lon: Target grid longitudes with shape ``(y, x)``.
+    :type lon: numpy.ndarray
+    :returns: A report, or ``None`` when the month was already built; nothing is
+        written when the report lists problems.
+    :rtype: dict | None
+    :raises ValueError: If the month's grid differs from the static grid.
+    """
     target = out / "months" / f"pairs_{tag}.zarr"
     if target.exists():
         return None
-    c = xr.open_zarr(cerra_dir / "months" / f"t2m_{tag}.zarr").load()
-    if not (np.array_equal(c.lat.values, static_lat) and np.array_equal(c.lon.values, static_lon)):
-        raise ValueError(f"{tag}: CERRA month grid differs from the static grid")
-    t0 = time.time()
-    era5 = e2c.t2m(c.time.values)
-    rep = month_checks(era5, c.t2m.values)
-    rep.update(tag=tag, steps=int(c.sizes["time"]), fetch_seconds=round(time.time() - t0, 1))
+    fine = xr.open_zarr(target_dir / "months" / f"t2m_{tag}.zarr").load()
+    if not (np.array_equal(fine.lat.values, lat) and np.array_equal(fine.lon.values, lon)):
+        raise ValueError(f"{tag}: the month's grid differs from the static grid")
+    started = time.time()
+    coarse_values = coarse.field(fine.time.values)
+    report = month_checks(coarse_values, fine.t2m.values)
+    report.update(tag=tag, steps=int(fine.sizes["time"]), fetch_seconds=round(time.time() - started, 1))
     problems = []
-    if rep["nan_era5"] or rep["nan_cerra"]:
-        problems.append("NaN values")
-    if not rep["corr"] > 0.9:
-        problems.append(f"low correlation {rep['corr']}")
-    if abs(rep["mean_diff_K"]) > 3:
-        problems.append(f"large mean difference {rep['mean_diff_K']} K")
-    rep["problems"] = problems
+    if report["nan_coarse"] or report["nan_fine"]:
+        problems.append("missing values")
+    if not report["corr"] > 0.9:
+        problems.append(f"low correlation {report['corr']}")
+    if abs(report["mean_diff_K"]) > 3:
+        problems.append(f"large mean difference {report['mean_diff_K']} K")
+    report["problems"] = problems
     if problems:
-        return rep                                          # nothing written
-    ds = xr.Dataset({"era5_t2m": (("time", "y", "x"), era5), "cerra_t2m": (("time", "y", "x"), c.t2m.values.astype("f4"))},
-                    coords={"time": c.time.values, "lat": (("y", "x"), static_lat), "lon": (("y", "x"), static_lon)})
-    for v in ("era5_t2m", "cerra_t2m"):
-        ds[v].attrs["units"] = "K"
-    ds["era5_t2m"].attrs["long_name"] = "ERA5 2 m temperature, bilinear onto the CERRA grid"
+        return report
+
+    ds = xr.Dataset(
+        {
+            "coarse_t2m": (("time", "y", "x"), coarse_values),
+            "fine_t2m": (("time", "y", "x"), fine.t2m.values.astype("f4")),
+        },
+        coords={"time": fine.time.values, "lat": (("y", "x"), lat), "lon": (("y", "x"), lon)},
+    )
+    for name in ("coarse_t2m", "fine_t2m"):
+        ds[name].attrs["units"] = "K"
+    ds["coarse_t2m"].attrs["long_name"] = "coarse 2 m temperature, bilinear onto the target grid"
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(target.name + ".tmp"); shutil.rmtree(tmp, ignore_errors=True)
-    _clean(ds).to_zarr(tmp, mode="w"); tmp.rename(target)
-    return rep
+    tmp = target.with_name(target.name + ".tmp")
+    shutil.rmtree(tmp, ignore_errors=True)
+    _clean(ds).to_zarr(tmp, mode="w")
+    tmp.rename(target)
+    return report
 
 
-def do_static(cerra_dir: Path, out: Path, e2c: Era5OnCerra, z_era5: xr.DataArray) -> Path:
+def do_static(target_dir: Path, out: Path, coarse: CoarseOnTargetGrid, geopotential: xr.DataArray) -> Path:
+    """Write the static fields both grids contribute.
+
+    :param target_dir: Directory holding the downloaded target data.
+    :type target_dir: pathlib.Path
+    :param out: Output directory.
+    :type out: pathlib.Path
+    :param coarse: Coarse source bound to the target grid.
+    :type coarse: CoarseOnTargetGrid
+    :param geopotential: Coarse surface geopotential [m^2 s^-2].
+    :type geopotential: xarray.DataArray
+    :returns: Path to the static store.
+    :rtype: pathlib.Path
+    """
     target = out / "static.zarr"
     if target.exists():
         return target
-    st = xr.open_zarr(cerra_dir / "cerra_france_static.zarr").load()
-    h_era5 = e2c.static_height(z_era5)
-    ds = xr.Dataset({"cerra_orography": st.orography.astype("f4"), "land_sea_mask": st.land_sea_mask.astype("f4"),
-                     "era5_orography": (("y", "x"), h_era5)},
-                    coords={"lat": st.lat, "lon": st.lon})
-    for v in ("cerra_orography", "era5_orography"):
-        ds[v].attrs["units"] = "m"
+    fine = xr.open_zarr(target_dir / "static.zarr").load()
+    ds = xr.Dataset(
+        {
+            "cerra_orography": fine.orography.astype("f4"),
+            "land_sea_mask": fine.land_sea_mask.astype("f4"),
+            "era5_orography": (("y", "x"), coarse.surface_height(geopotential)),
+        },
+        coords={"lat": fine.lat, "lon": fine.lon},
+    )
+    for name in ("cerra_orography", "era5_orography"):
+        ds[name].attrs["units"] = "m"
     out.mkdir(parents=True, exist_ok=True)
     _clean(ds).to_zarr(target, mode="w")
-    dh = ds.cerra_orography - ds.era5_orography
-    logger.info("static: CERRA orography %.0f..%.0f m, ERA5 (on CERRA grid) %.0f..%.0f m, difference %.0f..%.0f m",
-                float(ds.cerra_orography.min()), float(ds.cerra_orography.max()),
-                float(ds.era5_orography.min()), float(ds.era5_orography.max()), float(dh.min()), float(dh.max()))
+    difference = ds.cerra_orography - ds.era5_orography
+    logger.info(
+        "static fields: fine orography %.0f..%.0f m, coarse %.0f..%.0f m, difference %.0f..%.0f m",
+        float(ds.cerra_orography.min()), float(ds.cerra_orography.max()),
+        float(ds.era5_orography.min()), float(ds.era5_orography.max()),
+        float(difference.min()), float(difference.max()),
+    )
     return target
 
 
-# ---------------------------------------------------------------------------
-# consolidate: merge, statistics (training years only), checks, figure
-# ---------------------------------------------------------------------------
-def consolidate(out: Path, years, train_years) -> dict:
-    tags = [f"{y}{m:02d}" for y in range(years[0], years[1] + 1) for m in range(1, 13)]
+def consolidate(cfg: Config, out: Path) -> dict:
+    """Merge the months, compute normalisation statistics and draw a check figure.
+
+    Statistics come from the training years only, so the validation years stay
+    untouched.
+
+    :param cfg: Pipeline configuration.
+    :type cfg: weather_pipeline.config.Config
+    :param out: Output directory.
+    :type out: pathlib.Path
+    :returns: Normalisation statistics and sanity checks, also written to ``stats.json``.
+    :rtype: dict
+    :raises FileNotFoundError: If any month is still missing.
+    :raises ValueError: If the consolidated times are not strictly increasing.
+    """
+    first, last = int(cfg.target.years[0]), int(cfg.target.years[1])
+    tags = [f"{y}{m:02d}" for y in range(first, last + 1) for m in range(1, 13)]
     paths = [out / "months" / f"pairs_{t}.zarr" for t in tags]
     missing = [p.name for p in paths if not p.exists()]
     if missing:
         raise FileNotFoundError(f"{len(missing)} month(s) not built yet, e.g. {missing[:3]}")
     ds = xr.open_mfdataset([str(p) for p in paths], engine="zarr", combine="nested", concat_dim="time")
     ds = ds.chunk({"time": 124, "y": -1, "x": -1})
-    t = pd.DatetimeIndex(ds.time.values)
-    assert t.is_monotonic_increasing and not t.has_duplicates
-    st = xr.open_zarr(out / "static.zarr").load()
+    times = pd.DatetimeIndex(ds.time.values)
+    if not times.is_monotonic_increasing or times.has_duplicates:
+        raise ValueError("consolidated times are not strictly increasing")
+    static = xr.open_zarr(out / "static.zarr").load()
 
-    train = ds.sel(time=slice(f"{train_years[0]}-01-01", f"{train_years[1]}-12-31T23:59"))
-    resid = train.cerra_t2m - train.era5_t2m
-    dh = st.cerra_orography - st.era5_orography
+    train_first, train_last = int(cfg.target.train_years[0]), int(cfg.target.train_years[1])
+    train = ds.sel(time=slice(f"{train_first}-01-01", f"{train_last}-12-31T23:59"))
+    residual = train.fine_t2m - train.coarse_t2m
+    height_diff = static.cerra_orography - static.era5_orography
     stats = {
-        "train_years": list(train_years), "val_years": [y for y in range(years[0], years[1] + 1) if y > train_years[1]],
+        "train_years": [train_first, train_last],
+        "val_years": cfg.val_years,
         "n_train_steps": int(train.sizes["time"]),
-        "era5_t2m": {"mean": float(train.era5_t2m.mean().compute()), "std": float(train.era5_t2m.std().compute())},
-        "residual": {"mean": float(resid.mean().compute()), "std": float(resid.std().compute())},
-        "cerra_orography": {"mean": float(st.cerra_orography.mean()), "std": float(st.cerra_orography.std())},
-        "orography_diff": {"mean": float(dh.mean()), "std": float(dh.std())},
+        "era5_t2m": {"mean": float(train.coarse_t2m.mean().compute()), "std": float(train.coarse_t2m.std().compute())},
+        "residual": {"mean": float(residual.mean().compute()), "std": float(residual.std().compute())},
+        "cerra_orography": {"mean": float(static.cerra_orography.mean()), "std": float(static.cerra_orography.std())},
+        "orography_diff": {"mean": float(height_diff.mean()), "std": float(height_diff.std())},
     }
-    # physical sanity: the time-mean residual should fall with height above the ERA5 surface
-    mean_resid = resid.mean("time").compute().values.ravel()
-    x = dh.values.ravel()
-    ok = np.isfinite(mean_resid) & np.isfinite(x)
-    slope = float(np.polyfit(x[ok], mean_resid[ok], 1)[0])
-    stats["checks"] = {"residual_vs_height_slope_K_per_km": round(slope * 1000, 2),
-                       "baseline_rmse_train_K": round(float(np.sqrt((resid ** 2).mean().compute())), 3)}
-    ds.attrs = {"source": "ERA5 (bilinear onto CERRA grid) and CERRA, 2 m temperature, France",
-                "years": f"{years[0]}-{years[1]}", "train_years": f"{train_years[0]}-{train_years[1]}"}
-    _clean(ds).to_zarr(out / "pairs_france.zarr", mode="w")
+    mean_residual = residual.mean("time").compute().values.ravel()
+    heights = height_diff.values.ravel()
+    valid = np.isfinite(mean_residual) & np.isfinite(heights)
+    slope = float(np.polyfit(heights[valid], mean_residual[valid], 1)[0])
+    stats["checks"] = {
+        "residual_vs_height_slope_K_per_km": round(slope * 1000, 2),
+        "baseline_rmse_train_K": round(float(np.sqrt((residual ** 2).mean().compute())), 3),
+    }
+    ds.attrs = {
+        "source": "coarse source interpolated onto the target grid, with the target",
+        "years": f"{first}-{last}",
+        "train_years": f"{train_first}-{train_last}",
+    }
+    _clean(ds).to_zarr(out / "pairs.zarr", mode="w")
     (out / "stats.json").write_text(json.dumps(stats, indent=2))
-    logger.info("consolidated %d steps; residual mean %.2f K, std %.2f K; slope vs height %.2f K/km",
-                ds.sizes["time"], stats["residual"]["mean"], stats["residual"]["std"], slope * 1000)
-    _figure(out)
+    logger.info(
+        "consolidated %d steps; residual mean %.2f K, std %.2f K; slope against height %.2f K/km",
+        ds.sizes["time"], stats["residual"]["mean"], stats["residual"]["std"], slope * 1000,
+    )
+    check_figure(out)
     return stats
 
 
-def _figure(out: Path) -> None:
+def check_figure(out: Path) -> None:
+    """Draw the coarse field, the target, their difference and its dependence on height.
+
+    :param out: Output directory holding ``pairs.zarr`` and ``static.zarr``.
+    :type out: pathlib.Path
+    :returns: ``None``
+    :rtype: None
+    """
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    ds, st = xr.open_zarr(out / "pairs_france.zarr"), xr.open_zarr(out / "static.zarr")
-    afternoons = ds.time.dt.hour == 12
-    i = int(ds.cerra_t2m.where(afternoons).mean(("y", "x")).argmax().compute())   # hottest midday
-    e, c = ds.era5_t2m.isel(time=i).load() - 273.15, ds.cerra_t2m.isel(time=i).load() - 273.15
-    lo, hi = float(np.nanpercentile(c, 1)), float(np.nanpercentile(c, 99))
+
+    ds, static = xr.open_zarr(out / "pairs.zarr"), xr.open_zarr(out / "static.zarr")
+    midday = ds.time.dt.hour == 12
+    index = int(ds.fine_t2m.where(midday).mean(("y", "x")).argmax().compute())
+    coarse = ds.coarse_t2m.isel(time=index).load() - 273.15
+    fine = ds.fine_t2m.isel(time=index).load() - 273.15
+    low, high = float(np.nanpercentile(fine, 1)), float(np.nanpercentile(fine, 99))
     fig, ax = plt.subplots(1, 4, figsize=(20, 4.8), constrained_layout=True)
-    kw = dict(shading="auto")
-    for a, f, title in ((ax[0], e, "ERA5, bilinear onto CERRA grid"), (ax[1], c, "CERRA (target)")):
-        m = a.pcolormesh(st.lon, st.lat, f, cmap="RdYlBu_r", vmin=lo, vmax=hi, **kw); a.set_title(title)
-        fig.colorbar(m, ax=a, label="°C")
-    d = c - e; lim = float(np.nanpercentile(np.abs(d), 99))
-    m = ax[2].pcolormesh(st.lon, st.lat, d, cmap="RdBu_r", vmin=-lim, vmax=lim, **kw)
-    ax[2].set_title("CERRA - ERA5: what the downscaler must learn"); fig.colorbar(m, ax=ax[2], label="K")
-    dh = (st.cerra_orography - st.era5_orography).values.ravel()
-    ax[3].scatter(dh, d.values.ravel(), s=1, alpha=.2)
-    ax[3].plot([dh.min(), dh.max()], [-0.0065 * dh.min(), -0.0065 * dh.max()], "k--", lw=1, label="−6.5 K/km")
-    ax[3].set_xlabel("CERRA − ERA5 surface height (m)"); ax[3].set_ylabel("CERRA − ERA5 temperature (K)")
-    ax[3].set_title("Difference vs height difference"); ax[3].legend()
-    for a in ax[:3]:
-        a.set_aspect(1 / np.cos(np.deg2rad(46)))
-    fig.suptitle(f"{pd.Timestamp(ds.time.values[i]):%Y-%m-%d %H UTC}")
-    fig.savefig(out / "check.png", dpi=100); plt.close(fig)
+    for axis, field, title in (
+        (ax[0], coarse, "coarse, interpolated onto the target grid"),
+        (ax[1], fine, "target"),
+    ):
+        mesh = axis.pcolormesh(static.lon, static.lat, field, cmap="RdYlBu_r", vmin=low, vmax=high, shading="auto")
+        axis.set_title(title)
+        fig.colorbar(mesh, ax=axis, label="degC")
+    difference = fine - coarse
+    limit = float(np.nanpercentile(np.abs(difference), 99))
+    mesh = ax[2].pcolormesh(static.lon, static.lat, difference, cmap="RdBu_r", vmin=-limit, vmax=limit, shading="auto")
+    ax[2].set_title("target minus coarse: what the downscaler must learn")
+    fig.colorbar(mesh, ax=ax[2], label="K")
+    heights = (static.cerra_orography - static.era5_orography).values.ravel()
+    ax[3].scatter(heights, difference.values.ravel(), s=1, alpha=0.2)
+    ax[3].plot(
+        [heights.min(), heights.max()], [-0.0065 * heights.min(), -0.0065 * heights.max()],
+        "k--", lw=1, label="-6.5 K/km",
+    )
+    ax[3].set_xlabel("target minus coarse surface height (m)")
+    ax[3].set_ylabel("target minus coarse temperature (K)")
+    ax[3].set_title("difference against height difference")
+    ax[3].legend()
+    mid_lat = float(np.mean(static.lat.values))
+    for axis in ax[:3]:
+        axis.set_aspect(1 / np.cos(np.deg2rad(mid_lat)))
+    fig.suptitle(f"{pd.Timestamp(ds.time.values[index]):%Y-%m-%d %H UTC}")
+    fig.savefig(out / "check.png", dpi=100)
+    plt.close(fig)
 
 
-# ---------------------------------------------------------------------------
-def main(argv=None, source=None, z_era5=None) -> int:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--cerra", default="data/cerra")
-    p.add_argument("--out", default="data/pairs")
-    p.add_argument("--years", nargs=2, type=int, default=[2014, 2020])
-    p.add_argument("--train-years", nargs=2, type=int, default=None,
-                   help="default: all but the last year (2014-2019 for 2014-2020)")
-    p.add_argument("--batch", type=int, default=28, help="ERA5 time steps per fetch (memory vs. round trips)")
-    p.add_argument("--consolidate", action="store_true")
-    a = p.parse_args(argv)
+def main(argv: Sequence[str] | None = None, source=None, geopotential=None) -> int:
+    """Command-line entry point.
+
+    :param argv: Argument list; ``None`` reads ``sys.argv``.
+    :type argv: collections.abc.Sequence[str] | None
+    :param source: Coarse data source; ``None`` builds the configured one.
+    :type source: typing.Callable | None
+    :param geopotential: Coarse surface geopotential; ``None`` reads it from the source.
+    :type geopotential: xarray.DataArray | None
+    :returns: Exit status, non-zero when a month reported problems.
+    :rtype: int
+    """
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--config", default=None)
+    parser.add_argument("--target", default=None, help="overrides paths.target")
+    parser.add_argument("--out", default=None, help="overrides paths.pairs")
+    parser.add_argument("--batch", type=int, default=None, help="overrides coarse.fetch_batch")
+    parser.add_argument("--consolidate", action="store_true")
+    args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-    cerra_dir, out = Path(a.cerra), Path(a.out)
-    years = tuple(a.years)
-    train_years = tuple(a.train_years) if a.train_years else (years[0], max(years[0], years[1] - 1))
 
-    if a.consolidate:
-        s = consolidate(out, years, train_years)
-        print(json.dumps(s, indent=2)); return 0
+    cfg = load_config(args.config)
+    target_dir = Path(args.target or cfg.paths.target)
+    out = Path(args.out or cfg.paths.pairs)
 
-    st = xr.open_zarr(cerra_dir / "cerra_france_static.zarr")
+    if args.consolidate:
+        print(json.dumps(consolidate(cfg, out), indent=2))
+        return 0
+
+    static = xr.open_zarr(target_dir / "static.zarr")
     if source is None:
         from weather_pipeline.datasource import build_data_source
-        source = build_data_source("era5")
-    if z_era5 is None:
-        from weather_pipeline.statics import load_statics
-        z_era5 = load_statics(source)["z"]
-    e2c = Era5OnCerra(source, st.lat.values, st.lon.values, batch=a.batch)
-    do_static(cerra_dir, out, e2c, z_era5)
 
-    tags = [f"{y}{m:02d}" for y in range(years[0], years[1] + 1) for m in range(1, 13)]
+        source = build_data_source(cfg.coarse.source)
+    if geopotential is None:
+        from weather_pipeline.statics import load_statics
+
+        geopotential = load_statics(source)["z"]
+    coarse = CoarseOnTargetGrid(
+        source, static.lat.values, static.lon.values, cfg.coarse.variable,
+        batch=args.batch or cfg.coarse.fetch_batch,
+    )
+    do_static(target_dir, out, coarse, geopotential)
+
+    first, last = int(cfg.target.years[0]), int(cfg.target.years[1])
+    tags = [f"{y}{m:02d}" for y in range(first, last + 1) for m in range(1, 13)]
     pending, reports = [], []
     for tag in tags:
-        if not (cerra_dir / "months" / f"t2m_{tag}.zarr").exists():
-            pending.append(tag); continue
-        rep = do_month(cerra_dir, out, tag, e2c, st.lat.values, st.lon.values)
-        if rep is None:
+        if not (target_dir / "months" / f"t2m_{tag}.zarr").exists():
+            pending.append(tag)
             continue
-        reports.append(rep)
-        logger.info("%s: %d steps, ERA5 vs CERRA corr %.3f, mean diff %+.2f K, rmse %.2f K (%ss) %s",
-                    tag, rep["steps"], rep["corr"], rep["mean_diff_K"], rep["rmse_K"], rep["fetch_seconds"],
-                    "PROBLEMS: " + "; ".join(rep["problems"]) if rep["problems"] else "ok")
-    with open(out / "month_reports.jsonl", "a") as f:
-        for r in reports:
-            f.write(json.dumps(r) + "\n")
+        report = do_month(target_dir, out, tag, coarse, static.lat.values, static.lon.values)
+        if report is None:
+            continue
+        reports.append(report)
+        logger.info(
+            "%s: %d steps, correlation %.3f, mean difference %+.2f K, rmse %.2f K (%ss) %s",
+            tag, report["steps"], report["corr"], report["mean_diff_K"], report["rmse_K"],
+            report["fetch_seconds"], "problems: " + "; ".join(report["problems"]) if report["problems"] else "ok",
+        )
+    with open(out / "month_reports.jsonl", "a") as handle:
+        for report in reports:
+            handle.write(json.dumps(report) + "\n")
+
     done = len(list((out / "months").glob("pairs_*.zarr")))
     bad = [r["tag"] for r in reports if r["problems"]]
-    print(f"\n{done}/{len(tags)} months built; {len(pending)} waiting for CERRA; {len(bad)} with problems {bad if bad else ''}")
-    print("all months built: run again with --consolidate" if done == len(tags) else "rerun later to pick up new CERRA months")
+    print(f"\n{done}/{len(tags)} months built; {len(pending)} waiting for the target; {len(bad)} with problems {bad or ''}")
+    print(
+        "all months built: rerun with --consolidate" if done == len(tags)
+        else "rerun later to pick up newly downloaded months"
+    )
     return 1 if bad else 0
 
 
