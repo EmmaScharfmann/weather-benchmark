@@ -4,6 +4,10 @@ Usage::
 
     python scripts/eval_downscaled.py --config config.yaml
 
+Three series are read at every station and forecast hour: the raw coarse
+ensemble, the downscaled ensemble, and the raw field after interpolation onto
+the fine grid. The third exists only as a check that the two reading paths
+agree, since it should match the first closely.
 """
 
 from __future__ import annotations
@@ -23,6 +27,24 @@ from downscale import station_interp as si
 from downscale import station_scoring as ss
 from downscale.config import load_config
 from downscale.constants import SCORING_REGIONS, elevation_edges
+from downscale.diagnostics import (
+    DistributionSamples,
+    StationErrors,
+    edge_figure,
+    edge_profile,
+    coast_figure,
+    coast_profile,
+    gain_profile,
+    grid_spacing_km,
+    improvement_figure,
+    land_mask,
+    station_distance_to_coast,
+    mask_sea,
+    quantile_figure,
+    sea_report,
+    station_error_figure,
+    suggested_margin,
+)
 from downscale.stations import MeteoFranceHourly, QCConfig, load_stations
 
 logger = logging.getLogger("eval")
@@ -144,8 +166,8 @@ class EventScores:
         return pd.DataFrame(rows).sort_values(["threshold_C", "method", "lead_h"])
 
 
-def scorecard(results, binned, intervals, events, stations, edges, path: Path) -> None:
-    """Draw the four-panel scorecard.
+def scorecard(results, binned, intervals, events, stations, edges, by_lead, path: Path) -> None:
+    """Draw the six-panel scorecard.
 
     :param results: Metrics per method over lead time.
     :type results: dict[str, xarray.Dataset]
@@ -159,6 +181,8 @@ def scorecard(results, binned, intervals, events, stations, edges, path: Path) -
     :type stations: xarray.Dataset
     :param edges: Elevation band edges [m].
     :type edges: numpy.ndarray
+    :param by_lead: Long table of metrics by lead time, carrying ``valid_hour``.
+    :type by_lead: pandas.DataFrame
     :param path: Destination image.
     :type path: pathlib.Path
     :returns: ``None``
@@ -171,10 +195,12 @@ def scorecard(results, binned, intervals, events, stations, edges, path: Path) -
 
     hours = lambda ds: ds["lead_time"].values / np.timedelta64(1, "h")
     colour = {"coarse": "tab:blue", "downscaled": "tab:red"}
-    fig, ax = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
+    fig, ax = plt.subplots(3, 2, figsize=(12, 12), constrained_layout=True)
+
     for metric, axis, title in (
         ("rmse", ax[0, 0], "RMSE of the ensemble mean against stations (K)"),
         ("crps", ax[0, 1], "fair CRPS against stations (K)"),
+        ("bias", ax[1, 0], "bias, forecast minus observation (K)"),
     ):
         for method in ("coarse", "downscaled"):
             axis.plot(
@@ -190,7 +216,28 @@ def scorecard(results, binned, intervals, events, stations, edges, path: Path) -
         axis.set_title(title)
         axis.set_xlabel("lead time (h)")
         axis.grid(alpha=0.3)
+    ax[1, 0].axhline(0, color="k", lw=0.8)
     ax[0, 0].legend(fontsize=8)
+
+    hourly = by_lead.dropna(subset=["valid_hour"])
+    if len(hourly):
+        for metric, marker, style in (("bias", "o", "-"), ("rmse", "s", "--")):
+            for method in ("coarse", "downscaled"):
+                grouped = (
+                    hourly[hourly.method == method].groupby("valid_hour")[metric].mean().sort_index()
+                )
+                ax[1, 1].plot(
+                    grouped.index, grouped.values, color=colour[method], marker=marker, ls=style,
+                    label=f"{LABELS[method]}, {metric}",
+                )
+        ax[1, 1].axhline(0, color="k", lw=0.8)
+        ax[1, 1].set_xticks(sorted(hourly.valid_hour.unique()))
+        ax[1, 1].set_xlabel("valid hour (UTC)")
+        ax[1, 1].set_title("bias and RMSE by time of day, averaged over lead times (K)")
+        ax[1, 1].grid(alpha=0.3)
+        ax[1, 1].legend(fontsize=7)
+    else:
+        ax[1, 1].axis("off")
 
     (lat_min, lat_max), (lon_min, lon_max) = SCORING_REGIONS["france"]
     in_box = (
@@ -203,23 +250,30 @@ def scorecard(results, binned, intervals, events, stations, edges, path: Path) -
     ]
     for method in ("coarse", "downscaled"):
         values = binned[method].rmse.sel(region="france").mean("lead_time")
-        ax[1, 0].plot(range(len(values)), values.values, marker="o", color=colour[method], label=LABELS[method])
-    ax[1, 0].set_xticks(range(len(counts)))
-    ax[1, 0].set_xticklabels(
+        ax[2, 0].plot(range(len(values)), values.values, marker="o", color=colour[method], label=LABELS[method])
+    ax[2, 0].set_xticks(range(len(counts)))
+    ax[2, 0].set_xticklabels(
         [f"{int(low)}-{int(high)} m\nn={n}" for low, high, n in zip(edges[:-1], edges[1:], counts)], fontsize=7
     )
-    ax[1, 0].set_title("RMSE by station elevation, averaged over lead times")
-    ax[1, 0].grid(alpha=0.3)
-    ax[1, 0].legend(fontsize=8)
+    ax[2, 0].set_title("RMSE by station elevation, averaged over lead times")
+    ax[2, 0].grid(alpha=0.3)
+    ax[2, 0].legend(fontsize=8)
 
     hottest = events[events.threshold_C == events.threshold_C.max()]
+    active = hottest[hottest.obs_events > 0]
+    plotted = active if len(active) else hottest
     for method in ("coarse", "downscaled"):
-        subset = hottest[hottest.method == method].sort_values("lead_h")
-        ax[1, 1].plot(subset.lead_h, subset.brier, color=colour[method], marker="o", ms=3, label=LABELS[method])
-    ax[1, 1].set_title(f"Brier score, station temperature at or above {hottest.threshold_C.max():.0f} degC")
-    ax[1, 1].set_xlabel("lead time (h)")
-    ax[1, 1].grid(alpha=0.3)
-    ax[1, 1].legend(fontsize=8)
+        subset = plotted[plotted.method == method].sort_values("lead_h")
+        ax[2, 1].plot(
+            subset.lead_h, subset.brier, color=colour[method], marker="o", ms=4, ls="none", label=LABELS[method]
+        )
+    ax[2, 1].set_title(
+        f"Brier score, station temperature at or above {hottest.threshold_C.max():.0f} degC\n"
+        "(lead times where the event was observed)"
+    )
+    ax[2, 1].set_xlabel("lead time (h)")
+    ax[2, 1].grid(alpha=0.3)
+    ax[2, 1].legend(fontsize=8)
     fig.savefig(path, dpi=130)
     plt.close(fig)
 
@@ -246,11 +300,13 @@ def heatwave_map(peak, stations: xr.Dataset, variable: str, path: Path) -> None:
     _, downscaled_path, index = peak
     ds = xr.open_zarr(downscaled_path)
     valid = pd.Timestamp(ds["valid_time"].isel(time=0, lead_time=index).values)
-    coarse = ds["t2m_interp"].isel(time=0, lead_time=index).mean("ensemble").values - 273.15
-    fine = ds["t2m_ds"].isel(time=0, lead_time=index).mean(("ensemble", "sample")).values - 273.15
+    mask = land_mask(ds)
+    coarse = mask_sea(ds["t2m_interp"].isel(time=0, lead_time=index).mean("ensemble").values - 273.15, mask)
+    fine = mask_sea(ds["t2m_ds"].isel(time=0, lead_time=index).mean(("ensemble", "sample")).values - 273.15, mask)
     observed = stations[variable].sel(time=valid, method="nearest").values - 273.15
+    finite_fine = fine[np.isfinite(fine)]
     low, high = np.nanpercentile(
-        np.concatenate([fine.ravel(), observed[np.isfinite(observed)]]), [2, 98]
+        np.concatenate([finite_fine, observed[np.isfinite(observed)]]), [2, 98]
     )
     fig, ax = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=True)
     for axis, (title, field) in zip(
@@ -321,6 +377,8 @@ def run(cfg, forecast_paths, downscaled_paths, out_dir, provider=None) -> dict:
     bins = ss.default_bins(edges=cfg.evaluation.elevation_edges)
     thresholds = [t + 273.15 for t in cfg.evaluation.heat_thresholds_c]
     cases_all, cases_binned, events = [], [], EventScores(thresholds)
+    station_errors = StationErrors(["coarse", "downscaled"])
+    distributions = DistributionSamples(["coarse", "downscaled"])
     peak = None
     for forecast_path, downscaled_path in pairs:
         at = at_stations(forecast_path, downscaled_path, stations, variable)
@@ -344,6 +402,8 @@ def run(cfg, forecast_paths, downscaled_paths, out_dir, provider=None) -> dict:
             )
         )
         events.add(at, obs, ["coarse", "downscaled"])
+        station_errors.add(at, obs)
+        distributions.add(at, obs)
         observed_mean = np.nanmean(obs.values, axis=2)
         hottest = np.unravel_index(np.nanargmax(observed_mean), observed_mean.shape)
         if peak is None or observed_mean[hottest] > peak[0]:
@@ -402,7 +462,88 @@ def run(cfg, forecast_paths, downscaled_paths, out_dir, provider=None) -> dict:
         f"SSR {summary['ssr']['coarse']:.2f} -> {summary['ssr']['downscaled']:.2f}"
     )
 
-    scorecard(results, binned, intervals, event_table, stations, edges, out / "scorecard.png")
+    first_downscaled_store = xr.open_zarr(pairs[0][1])
+    diagnostics = {"sea": sea_report(first_downscaled_store)}
+    try:
+        profile = edge_profile(first_downscaled_store)
+        margin = suggested_margin(profile)
+        profile.to_csv(out / "edge_profile.csv", index=False)
+        edge_figure(profile, margin, out / "edge_check.png")
+        diagnostics["edge"] = {
+            "suggested_margin_cells": margin,
+            "interior_spread_K": profile.attrs["interior_spread_K"],
+            "interior_correction_K": profile.attrs["interior_correction_K"],
+        }
+        logger.info("edge effect reaches %d grid cell(s) into the domain", margin)
+    except ValueError as exc:
+        logger.warning("edge profile skipped: %s", exc)
+    if diagnostics["sea"]:
+        logger.info(
+            "correction over sea is %.1f times that over land",
+            diagnostics["sea"]["correction_ratio_sea_over_land"],
+        )
+    (out / "diagnostics.json").write_text(json.dumps(diagnostics, indent=2))
+
+    per_station = station_errors.table()
+    per_station.to_csv(out / "station_errors.csv", index=False)
+    station_error_figure(per_station, ["coarse", "downscaled"], LABELS, out / "station_errors.png")
+    first_store = xr.open_zarr(pairs[0][1])
+    diagnostics["improvement"] = improvement_figure(
+        per_station, "coarse", "downscaled",
+        first_store["orography"].values if "orography" in first_store else None,
+        first_store["lat"].values if "orography" in first_store else None,
+        first_store["lon"].values if "orography" in first_store else None,
+        out / "improvement.png",
+    )
+    coast_mask = land_mask(first_store)
+    if coast_mask is not None:
+        spacing = grid_spacing_km(first_store["lat"].values, first_store["lon"].values)
+        distance = station_distance_to_coast(
+            per_station, coast_mask, first_store["lat"].values, first_store["lon"].values, spacing
+        )
+        per_station["distance_to_coast_km"] = distance
+        per_station.to_csv(out / "station_errors.csv", index=False)
+        profile = coast_profile(per_station, distance, "coarse", "downscaled")
+        profile.to_csv(out / "coast_profile.csv", index=False)
+        diagnostics["coast"] = coast_figure(per_station, distance, profile, out / "coast.png")
+        print("\ngain from downscaling by distance from the coast")
+        print(profile.to_string(index=False))
+
+    elevation_bands = gain_profile(per_station, "elevation", list(edges[:-1]) + [1e6])
+    elevation_bands.to_csv(out / "gain_by_elevation.csv", index=False)
+    print("\ngain from downscaling by station elevation")
+    print(elevation_bands.to_string(index=False))
+
+    quantiles = distributions.quantiles()
+    quantiles.to_csv(out / "quantiles.csv", index=False)
+    quantile_figure(quantiles, ["coarse", "downscaled"], LABELS, out / "quantiles.png")
+    diagnostics["extremes"] = {
+        "observed_99.9th_degC": round(float(quantiles.loc[quantiles.level == 0.999, "observed"].iloc[0] - 273.15), 2),
+        **{
+            f"{method}_{kind}_99.9th_degC": round(
+                float(quantiles.loc[quantiles.level == 0.999, f"{method} {kind}"].iloc[0] - 273.15), 2
+            )
+            for method in ("coarse", "downscaled") for kind in ("member", "mean")
+        },
+    }
+    (out / "diagnostics.json").write_text(json.dumps(diagnostics, indent=2))
+
+    print("\nwhere downscaling helps")
+    for key, value in diagnostics["improvement"].items():
+        print(f"  {key:34s} {value}")
+    print("\nhighest temperatures, 99.9th percentile over all stations and times (degC)")
+    for key, value in diagnostics["extremes"].items():
+        print(f"  {key:34s} {value}")
+    afternoon = event_table[(event_table.obs_events > 0)]
+    if len(afternoon):
+        summary_events = afternoon.groupby(["threshold_C", "method"]).agg(
+            events=("obs_events", "sum"), hit_rate=("hit_rate", "mean"),
+            false_alarm_ratio=("false_alarm_ratio", "mean"), brier=("brier", "mean"),
+        ).round(3)
+        print("\nheat events, averaged over the lead times where they occurred")
+        print(summary_events.to_string())
+
+    scorecard(results, binned, intervals, event_table, stations, edges, by_lead, out / "scorecard.png")
     heatwave_map(peak, stations, cfg.stations.variables[0], out / "heatwave_map.png")
     print(f"\nwrote {out}/")
     return summary

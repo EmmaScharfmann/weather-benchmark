@@ -1,37 +1,37 @@
 """End-to-end tests of the pipeline scripts against synthetic sources."""
- 
+
 import json
 import sys
 from pathlib import Path
- 
+
 import numpy as np
 import pandas as pd
 import pytest
 import xarray as xr
- 
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-torch = pytest.importorskip("torch", reason="torch is installed with requirements/downscaler.txt")
- 
-from scripts import build_pairs, download_cerra, downscale_forecasts, eval_downscaled # noqa: E402
+
+import build_pairs  # noqa: E402
+import download_cerra  # noqa: E402
+import eval_downscaled  # noqa: E402
 from conftest import coarse_terrain, diurnal, terrain  # noqa: E402
-from downscale import downscaler as dsc  # noqa: E402
 from downscale.config import load_config  # noqa: E402
 
 
 def torch_modules():
     """Import the parts of the pipeline that need torch, skipping the test if it is absent.
- 
+
     :returns: The ``downscale_forecasts`` module and the downscaler module.
     :rtype: tuple[types.ModuleType, types.ModuleType]
     """
     pytest.importorskip("torch", reason="torch is installed with requirements/downscaler.txt")
     import downscale_forecasts
- 
+
     from weather_pipeline import downscaler
- 
+
     return downscale_forecasts, downscaler
- 
- 
+
+
 @pytest.fixture
 def source_grid():
     """Curvilinear source grid wider than the configured region."""
@@ -40,22 +40,22 @@ def source_grid():
     lat = 33.0 + 0.16 * yy + 0.015 * xx
     lon = (-18.0 + 0.22 * xx - 0.02 * yy) % 360
     return lat, lon
- 
- 
+
+
 @pytest.fixture
 def fake_cds(source_grid):
     """Climate Data Store client and GRIB opener backed by synthetic fields."""
     lat, lon = source_grid
     orography = terrain(lat, lon)
- 
+
     class Client:
         def __init__(self):
             self.requests = []
- 
+
         def retrieve(self, dataset, request, target):
             self.requests.append(request)
             Path(target).write_text(json.dumps(request))
- 
+
     def opener(path):
         request = json.loads(Path(path).read_text())
         coords = {
@@ -78,15 +78,15 @@ def fake_cds(source_grid):
             {"t2m": (("time", "y", "x"), values)},
             coords={**coords, "time": times.to_numpy(), "valid_time": ("time", times.to_numpy())},
         )
- 
+
     return Client(), opener
- 
- 
+
+
 @pytest.fixture
 def config_path(tmp_path):
     """A configuration file pointing every path into the temporary directory."""
     import yaml
- 
+
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump({
         "region": {"name": None, "box": [41.0, 51.5, -5.5, 10.0]},
@@ -98,14 +98,14 @@ def config_path(tmp_path):
         },
     }))
     return path
- 
- 
+
+
 @pytest.fixture
 def config(config_path):
     """Configuration parsed from :func:`config_path`."""
     return load_config(config_path)
- 
- 
+
+
 def test_download_crops_checks_and_consolidates(config, fake_cds, tmp_path):
     client, opener = fake_cds
     out = Path(config.paths.target)
@@ -126,23 +126,23 @@ def test_download_crops_checks_and_consolidates(config, fake_cds, tmp_path):
     assert len(client.requests) == requests
     consolidated = xr.open_zarr(download_cerra.consolidate(config, out))
     assert consolidated.sizes["time"] == 365 * 4
- 
- 
+
+
 def test_download_flags_a_month_with_missing_times(config, fake_cds):
     client, opener = fake_cds
     out = Path(config.paths.target)
     out.mkdir(parents=True)
     download_cerra.do_static(config, out, client=client, opener=opener)
- 
+
     def gappy_opener(path):
         ds = opener(path)
         return ds.isel(time=slice(4, None)) if "t2m" in ds else ds
- 
+
     tag, problems = download_cerra.do_month(config, out, 2014, 3, client=client, opener=gappy_opener)
     assert problems and "missing" in problems[0]
     assert not (out / "months" / "t2m_201403.zarr").exists()
- 
- 
+
+
 def test_apply_crop_rejects_a_different_grid(config, fake_cds):
     client, opener = fake_cds
     out = Path(config.paths.target)
@@ -152,8 +152,8 @@ def test_apply_crop_rejects_a_different_grid(config, fake_cds):
     standardised = download_cerra.standardise(opener(out / "grib" / "static.grib"))
     with pytest.raises(ValueError, match="differs"):
         download_cerra.apply_crop(standardised.isel(y=slice(0, 100)), crop)
- 
- 
+
+
 @pytest.fixture
 def downloaded_target(config, fake_cds):
     """A full year of synthetic target data on disk."""
@@ -164,8 +164,8 @@ def downloaded_target(config, fake_cds):
     for month in range(1, 13):
         download_cerra.do_month(config, out, 2014, month, client=client, opener=opener)
     return out
- 
- 
+
+
 def test_pairs_align_in_space_and_recover_the_lapse_rate(
     config, config_path, downloaded_target, analysis_source, global_grid
 ):
@@ -188,8 +188,8 @@ def test_pairs_align_in_space_and_recover_the_lapse_rate(
     static = xr.open_zarr(Path(config.paths.pairs) / "static.zarr")
     expected = coarse_terrain(static.lat.values, static.lon.values)
     assert np.abs(static.era5_orography.values - expected).max() < 25
- 
- 
+
+
 def test_pairs_consolidation_computes_statistics(
     config, config_path, downloaded_target, analysis_source, global_grid
 ):
@@ -206,8 +206,8 @@ def test_pairs_consolidation_computes_statistics(
     assert stats["n_train_steps"] == 365 * 4
     assert -7.5 < stats["checks"]["residual_vs_height_slope_K_per_km"] < -5.5
     assert (Path(config.paths.pairs) / "check.png").stat().st_size > 20_000
- 
- 
+
+
 @pytest.fixture
 def trained_model(tmp_path, static_fields, stats):
     """An untrained network saved as a checkpoint, enough to exercise inference."""
@@ -221,8 +221,8 @@ def trained_model(tmp_path, static_fields, stats):
     path = tmp_path / "model.pt"
     dsc.Downscaler(net, stats, static_fields).save(path)
     return path
- 
- 
+
+
 def test_downscaling_produces_an_ensemble_on_the_fine_grid(
     config, config_path, forecast_store, trained_model, static_fields
 ):
@@ -241,8 +241,8 @@ def test_downscaling_produces_an_ensemble_on_the_fine_grid(
     expected = (300 - 0.0065 * terrain(static_fields["lat"], static_fields["lon"])) + diurnal(6)
     assert np.abs(result.t2m_interp.isel(time=0, lead_time=0, ensemble=0).values - expected).mean() < 0.5
     assert (Path(config.paths.downscaled) / "map_check.png").exists()
- 
- 
+
+
 def test_downscaling_refuses_an_unfinished_forecast(config, config_path, forecast_store, trained_model):
     downscale_forecasts, _ = torch_modules()
     marker = forecast_store / "forecast_2023-08-05.zarr.done"
@@ -253,13 +253,13 @@ def test_downscaling_refuses_an_unfinished_forecast(config, config_path, forecas
             "--forecasts", str(forecast_store / "forecast_2023-08-05.zarr"),
             "--out", config.paths.downscaled, "--device", "cpu",
         ])
- 
- 
+
+
 class _StationProvider:
     """Provider generating observations consistent with the synthetic terrain."""
- 
+
     name, license = "fake", "test licence"
- 
+
     def __init__(self, n=50):
         rng = np.random.default_rng(1)
         self.lat = rng.uniform(42, 50.5, n)
@@ -270,10 +270,10 @@ class _StationProvider:
             "latitude": self.lat, "longitude": self.lon, "elevation": self.elevation,
             "start_date": pd.Timestamp("2000-01-01"), "end_date": pd.NaT,
         })
- 
+
     def list_stations(self, region, start, end, variables):
         return self.table.copy()
- 
+
     def fetch(self, ids, start, end, variables):
         hours = pd.date_range(start, end, freq="1h")
         rows = []
@@ -287,8 +287,8 @@ class _StationProvider:
                 "station_id": station_id, "variable": "t2m", "time": hours, "value": values,
             }))
         return pd.concat(rows, ignore_index=True)
- 
- 
+
+
 def test_evaluation_compares_both_forecasts_and_the_reading_paths_agree(
     config, config_path, forecast_store, trained_model
 ):
@@ -316,8 +316,8 @@ def test_evaluation_compares_both_forecasts_and_the_reading_paths_agree(
     assert np.abs(by_lead["coarse_on_fine_grid"] - by_lead["coarse"]).max() < 0.15
     assert summary["members"] == {"coarse": 3, "downscaled": 9}
     assert np.isfinite(summary["rmse_K"]["downscaled"])
- 
- 
+
+
 def test_evaluation_rejects_a_stale_downscaled_store(config, config_path, forecast_store, trained_model):
     downscale_forecasts, _ = torch_modules()
     downscale_forecasts.main([
@@ -328,7 +328,7 @@ def test_evaluation_rejects_a_stale_downscaled_store(config, config_path, foreca
     path = Path(config.paths.downscaled) / "forecast_2023-08-05.zarr"
     truncated = xr.open_zarr(path).isel(ensemble=slice(0, 2)).load()
     import shutil
- 
+
     shutil.rmtree(path)
     truncated.to_zarr(path)
     stations = xr.Dataset(
@@ -343,3 +343,33 @@ def test_evaluation_rejects_a_stale_downscaled_store(config, config_path, foreca
         eval_downscaled.at_stations(
             forecast_store / "forecast_2023-08-05.zarr", path, stations, "t2m"
         )
+
+
+def test_spectrum_script_reports_a_ratio_to_the_target(config_path, tmp_path, trained_model, static_fields):
+    """The spectrum script runs on a pairs directory and writes its three outputs."""
+    torch_modules()
+    import check_spectrum
+
+    lat, lon = static_fields["lat"], static_fields["lon"]
+    times = pd.date_range("2014-07-01T12", periods=6, freq="1D").to_numpy().astype("datetime64[ns]")
+    rng = np.random.default_rng(0)
+    coarse = (290 + rng.normal(0, 1, (len(times), *lat.shape))).astype("f4")
+    fine = (coarse + rng.normal(0, 0.5, coarse.shape)).astype("f4")
+    pairs = Path(tmp_path) / "pairs"
+    (pairs / "months").mkdir(parents=True)
+    xr.Dataset(
+        {"coarse_t2m": (("time", "y", "x"), coarse), "fine_t2m": (("time", "y", "x"), fine)},
+        coords={"time": times, "lat": (("y", "x"), lat), "lon": (("y", "x"), lon)},
+    ).to_zarr(pairs / "months" / "pairs_201407.zarr")
+
+    out = Path(tmp_path) / "spectrum"
+    status = check_spectrum.main([
+        "--config", str(config_path), "--model", str(trained_model), "--pairs", str(pairs),
+        "--out", str(out), "--n-times", "4", "--hour", "12", "--members", "3", "--device", "cpu",
+    ])
+    assert status == 0
+    for name in ("spectrum.csv", "spectrum.png", "spectrum.json"):
+        assert (out / name).stat().st_size > 0
+    comparison = pd.read_csv(out / "spectrum.csv")
+    assert {"target", "coarse", "model member", "model mean"} <= set(comparison.columns)
+    assert (comparison.wavelength_km.diff().dropna() < 0).all()

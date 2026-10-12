@@ -29,6 +29,7 @@ import xarray as xr
 from downscale import downscaler as dsc
 from downscale.config import load_config
 from downscale.constants import elevation_edges
+from downscale.diagnostics import land_mask
 
 logger = logging.getLogger("train")
 
@@ -331,6 +332,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--members", type=int, default=None)
     parser.add_argument("--eval-members", type=int, default=None)
     parser.add_argument("--max-steps-per-epoch", type=int, default=None)
+    parser.add_argument("--upsample", choices=["transpose", "bilinear"], default=None)
+    parser.add_argument("--noise-fine-fraction", type=float, default=None)
+    parser.add_argument(
+        "--all-points", dest="land_only", action="store_false", default=None,
+        help="train on every grid point instead of land only",
+    )
     parser.add_argument("--val-start", default=None)
     parser.add_argument("--val-end", default=None)
     parser.add_argument("--device", default=None)
@@ -339,7 +346,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     cfg = load_config(args.config)
     training = cfg.training
-    for name in ("loss", "epochs", "batch_size", "learning_rate", "members", "eval_members", "max_steps_per_epoch"):
+    for name in (
+        "loss", "epochs", "batch_size", "learning_rate", "members", "eval_members",
+        "max_steps_per_epoch", "land_only", "upsample", "noise_fine_fraction",
+    ):
         value = getattr(args, name, None)
         if value is not None:
             setattr(training, name, value)
@@ -369,7 +379,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     val_coarse, val_fine = coarse[val_mask], fine[val_mask]
     val_times = times[val_mask].to_numpy()
 
-    land = static["land_sea_mask"] > 0.5
+    land = land_mask(static)
     groups = {"land": land}
     edges = elevation_edges(cfg.evaluation.elevation_edges)
     for low, high in zip(edges[:-1], edges[1:]):
@@ -381,6 +391,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     model_cfg = dsc.Config(
         loss=training.loss, base=training.base_channels, depth=training.depth,
         noise_channels=training.noise_channels if training.loss == "crps" else 0,
+        upsample=training.upsample, noise_fine_fraction=training.noise_fine_fraction,
+        noise_coarse_factor=training.noise_coarse_factor,
     )
     net = dsc.DownscalerNet(model_cfg).to(device)
     steps_per_epoch = len(train_idx) // training.batch_size
@@ -393,9 +405,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     loss_fn = dsc.fair_crps if model_cfg.stochastic else dsc.mse
     train_members = training.members if model_cfg.stochastic else 1
     eval_members = training.eval_members if model_cfg.stochastic else 1
+    loss_mask = torch.from_numpy(land).to(device) if training.land_only else None
+    headline = "land" if training.land_only else "all"
     logger.info(
-        "model: %s loss, %.2fM parameters, %d steps per epoch, device %s",
-        training.loss, sum(p.numel() for p in net.parameters()) / 1e6, steps_per_epoch, device,
+        "model: %s loss over %s, %s upsampling, %.0f%% full-resolution noise, %.2fM parameters, "
+        "%d steps per epoch, device %s",
+        training.loss, "land only" if training.land_only else "every grid point", training.upsample,
+        100 * training.noise_fine_fraction, sum(p.numel() for p in net.parameters()) / 1e6,
+        steps_per_epoch, device,
     )
 
     best, history = None, []
@@ -410,7 +427,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 dsc.make_inputs(coarse_batch, times[idx].to_numpy(), static_norm, stats)
             ).to(device)
             target = torch.from_numpy(dsc.residual_norm(coarse_batch, fine_batch, stats)).to(device)
-            loss = loss_fn(net(x, train_members), target)
+            loss = loss_fn(net(x, train_members), target, loss_mask)
             optimiser.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
@@ -418,25 +435,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             scheduler.step()
             losses.append(float(loss))
         model_scores, baseline_scores = validate(
-            net, val_coarse, val_fine, val_times, static_norm, stats, eval_members, device
+            net, val_coarse, val_fine, val_times, static_norm, stats, eval_members, device,
+            groups={"land": land},
         )
         record = {
-            "epoch": epoch, "train_loss": float(np.mean(losses)),
-            "val": model_scores["all"], "baseline": baseline_scores["all"],
+            "epoch": epoch, "train_loss": float(np.mean(losses)), "scored_over": headline,
+            "val": model_scores[headline], "baseline": baseline_scores[headline],
             "seconds": round(time.time() - started, 1),
         }
         history.append(record)
         logger.info(
             "epoch %d/%d  loss %.4f  val rmse %.3f K (interpolation %.3f)  crps %.3f K (interpolation %.3f)  "
-            "ssr %s  [%.0fs]",
-            epoch, training.epochs, record["train_loss"], model_scores["all"]["rmse"],
-            baseline_scores["all"]["rmse"], model_scores["all"]["crps"], baseline_scores["all"]["crps"],
-            model_scores["all"]["ssr"], record["seconds"],
+            "ssr %s  over %s  [%.0fs]",
+            epoch, training.epochs, record["train_loss"], model_scores[headline]["rmse"],
+            baseline_scores[headline]["rmse"], model_scores[headline]["crps"],
+            baseline_scores[headline]["crps"], model_scores[headline]["ssr"], headline, record["seconds"],
         )
-        score = model_scores["all"]["crps"] if model_cfg.stochastic else model_scores["all"]["rmse"]
+        score = model_scores[headline]["crps"] if model_cfg.stochastic else model_scores[headline]["rmse"]
         if best is None or score < best:
             best = score
-            dsc.Downscaler(net, stats, static, device).save(out / "model.pt", extra={"epoch": epoch})
+            dsc.Downscaler(net, stats, static, device).save(
+                out / "model.pt", extra={"epoch": epoch, "land_only": bool(training.land_only)}
+            )
         (out / "history.json").write_text(json.dumps(history, indent=2))
 
     best_model = dsc.Downscaler.load(out / "model.pt", device)
@@ -445,6 +465,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     report = {
         "loss": training.loss,
+        "land_only": bool(training.land_only),
+        "scored_over": headline,
+        "upsample": training.upsample,
+        "noise_fine_fraction": training.noise_fine_fraction,
         "val_period": [str(times[val_mask].min()), str(times[val_mask].max())],
         "best_epoch": torch.load(out / "model.pt", weights_only=False)["extra"]["epoch"],
         "model": model_scores,
@@ -459,7 +483,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"  {key:20s} {baseline_scores[key]['rmse']:10.3f}  {model_scores[key]['rmse']:11.3f}  "
             f"{model_scores[key]['crps']:11.3f}   {model_scores[key]['ssr']}"
         )
-    improved = model_scores["all"]["rmse"] < baseline_scores["all"]["rmse"]
+    improved = model_scores[headline]["rmse"] < baseline_scores[headline]["rmse"]
     print(f"\n{'model beats interpolation' if improved else 'model does not beat interpolation'}; outputs in {out}/")
     return 0
 

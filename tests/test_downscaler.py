@@ -115,3 +115,77 @@ def test_residual_and_kelvin_conversions_are_inverse(stats):
     normalised = dsc.residual_norm(coarse, fine, stats)
     recovered = dsc.to_kelvin(coarse, normalised[:, None], stats)
     assert np.allclose(recovered[:, 0], fine, atol=1e-4)
+
+
+def test_masked_losses_ignore_the_excluded_pixels():
+    rng = np.random.default_rng(3)
+    pred = torch.from_numpy(rng.normal(size=(4, 6, 8, 9)).astype("f4"))
+    target = torch.from_numpy(rng.normal(size=(4, 8, 9)).astype("f4"))
+    mask = torch.zeros(8, 9, dtype=torch.bool)
+    mask[:, :5] = True
+    for loss in (dsc.fair_crps, dsc.mse):
+        masked = float(loss(pred, target, mask))
+        subset = float(loss(pred[..., :5], target[..., :5]))
+        assert masked == pytest.approx(subset, rel=1e-5)
+        assert masked != pytest.approx(float(loss(pred, target)), rel=1e-3)
+
+
+def test_a_masked_loss_leaves_the_excluded_region_without_gradient():
+    torch.manual_seed(0)
+    net = dsc.DownscalerNet(dsc.Config(loss="mse", base=8, depth=1, noise_channels=0))
+    inputs = torch.zeros(2, len(CHANNELS), 16, 16)
+    target = torch.zeros(2, 16, 16)
+    target[:, :, 8:] = 10.0
+    mask = torch.zeros(16, 16, dtype=torch.bool)
+    mask[:, :8] = True
+    dsc.mse(net(inputs, 1), target, mask).backward()
+    masked_gradient = net.unet.out.bias.grad.clone()
+    net.zero_grad()
+    dsc.mse(net(inputs, 1), target).backward()
+    assert not torch.allclose(masked_gradient, net.unet.out.bias.grad)
+    assert float(masked_gradient.abs().sum()) == pytest.approx(0.0, abs=1e-6)
+
+
+@pytest.mark.parametrize("upsample", ["transpose", "bilinear"])
+def test_both_upsampling_methods_preserve_the_grid(upsample, static_fields, stats):
+    height, width = static_fields["lat"].shape
+    net = dsc.DownscalerNet(dsc.Config(base=8, depth=3, upsample=upsample))
+    coarse = np.full((2, height, width), 290.0, "f4")
+    times = np.array(["2020-07-01T00", "2020-07-01T12"], "datetime64[ns]")
+    inputs = torch.from_numpy(dsc.make_inputs(coarse, times, dsc.static_stack(static_fields, stats), stats))
+    assert net(inputs, members=3).shape == (2, 3, height, width)
+
+
+def test_unknown_upsampling_is_rejected():
+    with pytest.raises(ValueError, match="transpose"):
+        dsc.UNet(4, 1, 8, 2, upsample="nearest")
+
+
+def test_coarse_only_noise_is_smooth_at_the_grid_scale():
+    torch.manual_seed(0)
+    rough = dsc.DownscalerNet(dsc.Config(base=8, noise_channels=4, noise_fine_fraction=1.0))
+    smooth = dsc.DownscalerNet(dsc.Config(base=8, noise_channels=4, noise_fine_fraction=0.0))
+    gradient = lambda n: float((n[..., 1:] - n[..., :-1]).abs().mean())
+    rough_noise = rough._noise(2, 64, 64, "cpu")
+    smooth_noise = smooth._noise(2, 64, 64, "cpu")
+    assert rough_noise.shape == smooth_noise.shape == (2, 4, 64, 64)
+    assert gradient(smooth_noise) < gradient(rough_noise) / 5
+
+
+def test_noise_split_respects_the_requested_fraction():
+    net = dsc.DownscalerNet(dsc.Config(base=8, noise_channels=4, noise_fine_fraction=0.5))
+    torch.manual_seed(0)
+    noise = net._noise(1, 32, 32, "cpu")
+    gradient = (noise[..., 1:] - noise[..., :-1]).abs().mean(dim=(0, 2, 3))
+    assert float(gradient[:2].mean()) > float(gradient[2:].mean()) * 5
+
+
+def test_a_checkpoint_without_the_newer_fields_still_loads(tmp_path, static_fields, stats):
+    model = dsc.Downscaler(dsc.DownscalerNet(dsc.Config(base=8)), stats, static_fields)
+    model.save(tmp_path / "model.pt")
+    checkpoint = torch.load(tmp_path / "model.pt", weights_only=False)
+    checkpoint["config"] = {"loss": "crps", "base": 8, "depth": 3, "noise_channels": 4}
+    torch.save(checkpoint, tmp_path / "model.pt")
+    restored = dsc.Downscaler.load(tmp_path / "model.pt", device="cpu")
+    assert restored.net.cfg.upsample == "transpose"
+    assert restored.net.cfg.noise_fine_fraction == 0.5

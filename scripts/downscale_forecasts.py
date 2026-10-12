@@ -3,7 +3,10 @@
 Usage::
 
     python scripts/downscale_forecasts.py --config config.yaml --model runs/crps/model.pt
-    
+
+Each coarse member yields several plausible fine-scale maps, so a ten-member
+forecast becomes a larger downscaled ensemble. Initialisations already
+processed are skipped unless the forecast has gained members since.
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ import xarray as xr
 
 from downscale.config import load_config
 from downscale.constants import MAX_FRACTION_OUTSIDE
+from downscale.diagnostics import land_mask, mask_sea, sea_report
 from downscale.downscaler import Downscaler
 from downscale.station_interp import GridInterpolator
 
@@ -121,6 +125,8 @@ def downscale_init(
         {
             "t2m_interp": (("time", "lead_time", "ensemble", "y", "x"), coarse),
             "t2m_ds": (("time", "lead_time", "ensemble", "sample", "y", "x"), fine),
+            "land_sea_mask": (("y", "x"), model.static["land_sea_mask"].astype("f4")),
+            "orography": (("y", "x"), model.static["cerra_orography"].astype("f4")),
         },
         coords={
             "time": forecast["time"].values,
@@ -134,6 +140,8 @@ def downscale_init(
     )
     for name in ("t2m_interp", "t2m_ds"):
         result[name].attrs["units"] = "K"
+    result["orography"].attrs["units"] = "m"
+    result["land_sea_mask"].attrs["long_name"] = "land fraction of the fine grid cell"
     result.attrs = {
         "forecast": str(forecast_path),
         "model": str(model.net.cfg),
@@ -141,11 +149,20 @@ def downscale_init(
         "note": "t2m_ds holds, for each coarse member, several plausible fine-scale maps",
     }
     result = result.chunk({"lead_time": 10, "ensemble": 1, "sample": -1, "y": -1, "x": -1})
+    for name in ("land_sea_mask", "orography"):
+        result[name] = result[name].chunk({"y": -1, "x": -1})
     out_dir.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(target.name + ".tmp")
     shutil.rmtree(tmp, ignore_errors=True)
     result.to_zarr(tmp, mode="w")
     tmp.rename(target)
+    report = sea_report(result)
+    if report and report["correction_ratio_sea_over_land"] > 2:
+        logger.warning(
+            "the correction over sea is %.1f times the correction over land (%.2f against %.2f K): "
+            "the target reanalysis treats water differently, so sea values are not trustworthy",
+            report["correction_ratio_sea_over_land"], report["sea_correction_K"], report["land_correction_K"],
+        )
     correction = fine.mean(3) - coarse
     logger.info(
         "%s: %d lead times x %d members x %d samples in %.0fs; mean correction %+.2f K, "
@@ -176,8 +193,11 @@ def map_figure(path: Path, png: Path) -> None:
     hours = pd.to_datetime(ds["valid_time"].isel(time=0).values).hour
     candidates = np.flatnonzero(hours == 12) if (hours == 12).any() else np.arange(len(hours))
     index = int(candidates[np.argmax(mean_field.values[candidates])])
-    coarse = ds["t2m_interp"].isel(time=0, lead_time=index, ensemble=0).values - 273.15
-    fine = ds["t2m_ds"].isel(time=0, lead_time=index, ensemble=0).values - 273.15
+    mask = land_mask(ds)
+    coarse = mask_sea(ds["t2m_interp"].isel(time=0, lead_time=index, ensemble=0).values - 273.15, mask)
+    fine = np.stack([
+        mask_sea(f, mask) for f in ds["t2m_ds"].isel(time=0, lead_time=index, ensemble=0).values - 273.15
+    ])
     low, high = np.nanpercentile(fine, [1, 99])
     fig, ax = plt.subplots(1, 4, figsize=(20, 4.6), constrained_layout=True)
     panels = [

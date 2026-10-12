@@ -1,3 +1,5 @@
+"""Typed access to ``config.yaml``."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields, is_dataclass
@@ -98,8 +100,12 @@ class TrainingConfig:
     base_channels: int = 32
     depth: int = 3
     noise_channels: int = 4
+    upsample: str = "bilinear"
+    noise_fine_fraction: float = 0.0
+    noise_coarse_factor: int = 8
     seed: int = 0
     max_steps_per_epoch: int | None = None
+    land_only: bool = True
 
 
 @dataclass

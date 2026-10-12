@@ -1,13 +1,16 @@
-"""Build coarse - fine training pairs for the downscaler.
+"""Build coarse/fine training pairs for the downscaler.
 
 The coarse source is interpolated onto the target grid, so the model sees input
-and target pixel by pixel.
+and target pixel by pixel. The interpolated field is both the model's main
+input and the baseline it has to beat.
 
 Usage::
 
     python scripts/build_pairs.py --config config.yaml
     python scripts/build_pairs.py --config config.yaml --consolidate
 
+Months whose target file is not downloaded yet are reported as pending, so this
+can run alongside the download.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ import xarray as xr
 
 from downscale.config import Config, load_config
 from downscale.constants import COARSE_CROP_MARGIN_DEG, G
+from downscale.diagnostics import land_mask
 from downscale.regions import crop_indices
 from downscale.station_interp import GridInterpolator
 
@@ -283,6 +287,12 @@ def consolidate(cfg: Config, out: Path) -> dict:
     train = ds.sel(time=slice(f"{train_first}-01-01", f"{train_last}-12-31T23:59"))
     residual = train.fine_t2m - train.coarse_t2m
     height_diff = static.cerra_orography - static.era5_orography
+    land = land_mask(static)
+    if cfg.training.land_only and land is not None:
+        keep = xr.DataArray(land, dims=("y", "x"))
+        train = train.where(keep)
+        residual = residual.where(keep)
+        logger.info("statistics computed over land only (%.0f%% of the grid)", 100 * land.mean())
     stats = {
         "train_years": [train_first, train_last],
         "val_years": cfg.val_years,
@@ -296,6 +306,7 @@ def consolidate(cfg: Config, out: Path) -> dict:
     heights = height_diff.values.ravel()
     valid = np.isfinite(mean_residual) & np.isfinite(heights)
     slope = float(np.polyfit(heights[valid], mean_residual[valid], 1)[0])
+    stats["land_only"] = bool(cfg.training.land_only and land is not None)
     stats["checks"] = {
         "residual_vs_height_slope_K_per_km": round(slope * 1000, 2),
         "baseline_rmse_train_K": round(float(np.sqrt((residual ** 2).mean().compute())), 3),

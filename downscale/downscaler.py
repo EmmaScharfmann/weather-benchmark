@@ -1,12 +1,19 @@
-"""The downscaling model.
+"""The downscaling model: coarse field plus fine terrain to fine field.
+
 The network predicts the correction to add to the interpolated coarse field,
 and takes noise channels so that repeated passes give different plausible maps.
+With the fair CRPS loss those maps form an ensemble whose spread is trained to
+be realistic; with the mean squared error loss the network is deterministic and
+produces the conditional mean, which is smoother than reality.
+
+A saved checkpoint carries the weights, the normalisation statistics and the
+fine-grid terrain, so inference needs no other file.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 
 import numpy as np
 import torch
@@ -46,7 +53,10 @@ class _Block(nn.Module):
 class UNet(nn.Module):
     """Encoder-decoder with skip connections, zero-initialised output layer."""
 
-    def __init__(self, channels_in: int, channels_out: int = 1, base: int = 32, depth: int = 3):
+    def __init__(
+        self, channels_in: int, channels_out: int = 1, base: int = 32, depth: int = 3,
+        upsample: str = "transpose",
+    ):
         """
         :param channels_in: Input channels.
         :type channels_in: int
@@ -56,14 +66,25 @@ class UNet(nn.Module):
         :type base: int
         :param depth: Number of downsampling steps.
         :type depth: int
+        :param upsample: ``"transpose"`` for strided transposed convolutions, or ``"bilinear"``
+            for interpolation followed by a convolution, which avoids grid-scale artefacts.
+        :type upsample: str
+        :raises ValueError: If the upsampling method is unknown.
         """
         super().__init__()
+        if upsample not in ("transpose", "bilinear"):
+            raise ValueError("upsample must be 'transpose' or 'bilinear'")
         widths = [base * 2 ** i for i in range(depth + 1)]
         self.inc = _Block(channels_in, widths[0])
         self.down = nn.ModuleList([_Block(widths[i], widths[i + 1]) for i in range(depth)])
-        self.up = nn.ModuleList(
-            [nn.ConvTranspose2d(widths[i + 1], widths[i], 2, stride=2) for i in reversed(range(depth))]
-        )
+        self.up = nn.ModuleList([
+            nn.ConvTranspose2d(widths[i + 1], widths[i], 2, stride=2) if upsample == "transpose"
+            else nn.Sequential(
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                nn.Conv2d(widths[i + 1], widths[i], 3, padding=1),
+            )
+            for i in reversed(range(depth))
+        ])
         self.dec = nn.ModuleList([_Block(2 * widths[i], widths[i]) for i in reversed(range(depth))])
         self.out = nn.Conv2d(widths[0], channels_out, 1)
         nn.init.zeros_(self.out.weight)
@@ -87,12 +108,19 @@ class UNet(nn.Module):
 
 @dataclass
 class Config:
-    """Model architecture settings."""
+    """Model architecture settings.
+
+    The defaults reproduce the original architecture so that existing
+    checkpoints load unchanged.
+    """
 
     loss: str = "crps"
     base: int = 32
     depth: int = 3
     noise_channels: int = 4
+    upsample: str = "transpose"
+    noise_fine_fraction: float = 0.5
+    noise_coarse_factor: int = 8
 
     @property
     def stochastic(self) -> bool:
@@ -115,14 +143,15 @@ class DownscalerNet(nn.Module):
         super().__init__()
         self.cfg = cfg
         n_noise = cfg.noise_channels if cfg.stochastic else 0
-        self.unet = UNet(len(CHANNELS) + n_noise, 1, cfg.base, cfg.depth)
+        self.unet = UNet(len(CHANNELS) + n_noise, 1, cfg.base, cfg.depth, cfg.upsample)
 
     def _noise(self, n: int, height: int, width: int, device) -> torch.Tensor:
-        """Draw noise channels at two scales.
+        """Draw noise channels at one or two spatial scales.
 
-        Half the channels are drawn at full resolution and half at one eighth
-        and upsampled, so members differ coherently over tens of kilometres
-        rather than only pixel by pixel.
+        Channels drawn at reduced resolution and upsampled make members differ
+        coherently over tens of kilometres; channels drawn at full resolution
+        let them differ pixel by pixel, which shows up as excess power at the
+        grid scale. ``noise_fine_fraction`` sets the split.
 
         :param n: Batch size.
         :type n: int
@@ -135,11 +164,19 @@ class DownscalerNet(nn.Module):
         :returns: Noise of shape ``(n, noise_channels, height, width)``.
         :rtype: torch.Tensor
         """
-        k = self.cfg.noise_channels
-        fine = torch.randn(n, k // 2, height, width, device=device)
-        coarse = torch.randn(n, k - k // 2, math.ceil(height / 8), math.ceil(width / 8), device=device)
-        coarse = F.interpolate(coarse, size=(height, width), mode="bilinear", align_corners=False)
-        return torch.cat([fine, coarse], 1)
+        total = self.cfg.noise_channels
+        n_fine = int(round(total * self.cfg.noise_fine_fraction))
+        n_coarse = total - n_fine
+        parts = []
+        if n_fine:
+            parts.append(torch.randn(n, n_fine, height, width, device=device))
+        if n_coarse:
+            factor = max(1, self.cfg.noise_coarse_factor)
+            coarse = torch.randn(
+                n, n_coarse, math.ceil(height / factor), math.ceil(width / factor), device=device
+            )
+            parts.append(F.interpolate(coarse, size=(height, width), mode="bilinear", align_corners=False))
+        return torch.cat(parts, 1)
 
     def forward(self, x: torch.Tensor, members: int = 1) -> torch.Tensor:
         """Predict normalised corrections.
@@ -164,13 +201,15 @@ class DownscalerNet(nn.Module):
         return y.reshape(batch, m, height, width)
 
 
-def fair_crps(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Fair continuous ranked probability score, averaged over pixels.
+def fair_crps(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    """Fair continuous ranked probability score, averaged over the retained pixels.
 
     :param pred: Ensemble of shape ``(batch, members, height, width)``.
     :type pred: torch.Tensor
     :param target: Truth of shape ``(batch, height, width)``.
     :type target: torch.Tensor
+    :param mask: Boolean grid of shape ``(height, width)``; ``None`` keeps every pixel.
+    :type mask: torch.Tensor | None
     :returns: Scalar loss.
     :rtype: torch.Tensor
     :raises ValueError: If fewer than two members are given.
@@ -180,20 +219,24 @@ def fair_crps(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         raise ValueError("fair CRPS needs at least 2 members")
     skill = (pred - target[:, None]).abs().mean(1)
     spread = (pred[:, :, None] - pred[:, None]).abs().sum((1, 2)) / (2 * m * (m - 1))
-    return (skill - spread).mean()
+    score = skill - spread
+    return score.mean() if mask is None else score[:, mask].mean()
 
 
-def mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Mean squared error of the first member.
+def mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    """Mean squared error of the first member, averaged over the retained pixels.
 
     :param pred: Prediction of shape ``(batch, members, height, width)``.
     :type pred: torch.Tensor
     :param target: Truth of shape ``(batch, height, width)``.
     :type target: torch.Tensor
+    :param mask: Boolean grid of shape ``(height, width)``; ``None`` keeps every pixel.
+    :type mask: torch.Tensor | None
     :returns: Scalar loss.
     :rtype: torch.Tensor
     """
-    return ((pred[:, 0] - target) ** 2).mean()
+    squared_error = (pred[:, 0] - target) ** 2
+    return squared_error.mean() if mask is None else squared_error[:, mask].mean()
 
 
 def static_stack(static: dict, stats: dict) -> np.ndarray:
@@ -346,7 +389,8 @@ class Downscaler:
             raise ValueError(
                 f"checkpoint channels {checkpoint['channels']} differ from this code's {CHANNELS}"
             )
-        net = DownscalerNet(Config(**checkpoint["config"]))
+        known = {f.name for f in fields(Config)}
+        net = DownscalerNet(Config(**{k: v for k, v in checkpoint["config"].items() if k in known}))
         net.load_state_dict(checkpoint["state_dict"])
         return cls(net, checkpoint["stats"], checkpoint["static"], device)
 

@@ -1,32 +1,37 @@
+# Configuration for the downscaling pipeline.
+#
+# Every script accepts --config to point at a copy of this file, and
+# command-line flags override the values set here. To downscale a different
+# region or period, copy this file and edit it; no code changes are needed.
+
 region:
-  # A name from weather_pipeline.constants.REGION_PRESETS, or null.
+  # A preset name from weather_pipeline.constants.REGION_PRESETS, or null.
   name: france
-  
-  # Bounding box [lat_min, lat_max, lon_min, lon_max], with lon in -180..180.
-  # Note: Overrides `name` when set. 
-  # Note: Must cover the target grid plus a margin.
+  # Explicit bounding box [lat_min, lat_max, lon_min, lon_max], lon in -180..180.
+  # Overrides `name` when set. Must cover the target grid plus a margin.
   box: null
 
 paths:
-  target: data/cerra            # downloaded high-resolution target for downscaler training
-  pairs: data/pairs             # coarse - fine training pairs for downscaler training
+  target: data/cerra            # downloaded high-resolution target
+  pairs: data/pairs             # coarse/fine training pairs
   runs: runs                    # trained models and reports
-  forecasts: outputs/forecasts  # coarse ensemble forecasts, on which the downscaler will be applied
+  forecasts: outputs/forecasts  # coarse ensemble forecasts to downscale
   downscaled: outputs/downscaled
   evaluation: outputs/eval
-  stations_cache: outputs/cache/stations
+  stations_cache: outputs/cache/stations202508
 
 target:
-  dataset: reanalysis-cerra-single-levels # Name of the high resolution reanalysis used as the training target from Copernicus (url: https://cds.climate.copernicus.eu/api)
-  cds_workers: 2                          # concurrent Copernicus requests; keep small
+  # High-resolution reanalysis used as the training target.
+  dataset: reanalysis-cerra-single-levels
   variable: 2m_temperature
   static_variables: [orography, land_sea_mask]
-  years: [2014, 2020]           
-  train_years: [2014, 2019]     
+  years: [2014, 2020]           # inclusive
+  train_years: [2014, 2019]     # the rest become the validation years
   times: ["00:00", "06:00", "12:00", "18:00"]
-
+  cds_workers: 2                # concurrent Copernicus requests; keep small
 
 coarse:
+  # Coarse source providing the model input during training.
   source: era5
   variable: t2m
   fetch_batch: 28               # time steps per request
@@ -44,15 +49,27 @@ training:
   loss: crps                    # "crps" for an ensemble, "mse" for a single map
   members: 4                    # members per input during training
   eval_members: 8
-  epochs: 20
+  epochs: 5
   batch_size: 8
   learning_rate: 0.001
   weight_decay: 0.0001
   base_channels: 32
   depth: 3
   noise_channels: 4
+  # Decoder upsampling: "bilinear" (interpolate then convolve) avoids the
+  # grid-scale checkerboard that "transpose" (strided transposed convolution)
+  # produces. Use "transpose" only to reproduce an older run.
+  upsample: bilinear
+  # Fraction of the noise channels drawn at full resolution. Zero makes every
+  # member differ coherently over tens of kilometres rather than pixel by pixel.
+  noise_fine_fraction: 0.0
+  noise_coarse_factor: 8        # reduction factor for the coarse noise channels
   seed: 0
-  max_steps_per_epoch: null     
+  max_steps_per_epoch: null     # cap for quick checks
+  # Restrict the loss and the normalisation statistics to land. The sea is still
+  # given to the network as input, but the target over water comes from a
+  # different process than over land, so it should not drive the gradient.
+  land_only: true
 
 inference:
   samples: 4                    # downscaled maps per coarse ensemble member
