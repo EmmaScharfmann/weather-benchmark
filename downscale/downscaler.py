@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .constants import CHANNELS, TIME_CHANNELS
+from .constants import COAST_CHANNEL, STATIC_CHANNELS, TIME_CHANNELS, channels
 
 
 class _Block(nn.Module):
@@ -120,7 +120,17 @@ class Config:
     noise_channels: int = 4
     upsample: str = "transpose"
     noise_fine_fraction: float = 0.5
-    noise_coarse_factor: int = 8
+    noise_coarse_factor: int | list[int] = 8
+    coast_distance: bool = False
+
+    @property
+    def channels(self) -> list[str]:
+        """Input channel names this configuration implies.
+
+        :returns: Channel names in input order, excluding noise.
+        :rtype: list[str]
+        """
+        return channels(self.coast_distance)
 
     @property
     def stochastic(self) -> bool:
@@ -143,15 +153,17 @@ class DownscalerNet(nn.Module):
         super().__init__()
         self.cfg = cfg
         n_noise = cfg.noise_channels if cfg.stochastic else 0
-        self.unet = UNet(len(CHANNELS) + n_noise, 1, cfg.base, cfg.depth, cfg.upsample)
+        self.unet = UNet(len(cfg.channels) + n_noise, 1, cfg.base, cfg.depth, cfg.upsample)
 
     def _noise(self, n: int, height: int, width: int, device) -> torch.Tensor:
-        """Draw noise channels at one or two spatial scales.
+        """Draw noise channels across one or several spatial scales.
 
         Channels drawn at reduced resolution and upsampled make members differ
         coherently over tens of kilometres; channels drawn at full resolution
-        let them differ pixel by pixel, which shows up as excess power at the
-        grid scale. ``noise_fine_fraction`` sets the split.
+        let them differ pixel by pixel. Giving ``noise_coarse_factor`` a list
+        spreads the ensemble's variability over several scales instead of
+        concentrating it at one, which otherwise shows up as a peak in the
+        power spectrum at that scale.
 
         :param n: Batch size.
         :type n: int
@@ -171,11 +183,21 @@ class DownscalerNet(nn.Module):
         if n_fine:
             parts.append(torch.randn(n, n_fine, height, width, device=device))
         if n_coarse:
-            factor = max(1, self.cfg.noise_coarse_factor)
-            coarse = torch.randn(
-                n, n_coarse, math.ceil(height / factor), math.ceil(width / factor), device=device
-            )
-            parts.append(F.interpolate(coarse, size=(height, width), mode="bilinear", align_corners=False))
+            factors = self.cfg.noise_coarse_factor
+            factors = [factors] if isinstance(factors, int) else list(factors)
+            per_factor = [n_coarse // len(factors)] * len(factors)
+            for i in range(n_coarse - sum(per_factor)):
+                per_factor[i] += 1
+            for factor, count in zip(factors, per_factor):
+                if not count:
+                    continue
+                factor = max(1, int(factor))
+                coarse = torch.randn(
+                    n, count, math.ceil(height / factor), math.ceil(width / factor), device=device
+                )
+                parts.append(
+                    F.interpolate(coarse, size=(height, width), mode="bilinear", align_corners=False)
+                )
         return torch.cat(parts, 1)
 
     def forward(self, x: torch.Tensor, members: int = 1) -> torch.Tensor:
@@ -239,26 +261,34 @@ def mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None = No
     return squared_error.mean() if mask is None else squared_error[:, mask].mean()
 
 
-def static_stack(static: dict, stats: dict) -> np.ndarray:
+def static_stack(static: dict, stats: dict, coast_distance: bool = False) -> np.ndarray:
     """Normalise the static channels.
 
-    :param static: Fields ``cerra_orography``, ``era5_orography``, ``land_sea_mask``, ``lat`` and ``lon``.
+    :param static: Fields ``cerra_orography``, ``era5_orography``, ``land_sea_mask``, ``lat``,
+        ``lon`` and, when requested, ``coast_distance``.
     :type static: dict
     :param stats: Normalisation statistics with ``mean`` and ``std`` per field.
     :type stats: dict
-    :returns: Array of shape ``(5, height, width)`` in
-        :data:`~weather_pipeline.constants.STATIC_CHANNELS` order.
+    :param coast_distance: Include the distance-to-coast channel.
+    :type coast_distance: bool
+    :returns: Array of shape ``(n_static, height, width)`` in channel order.
     :rtype: numpy.ndarray
+    :raises KeyError: If the distance channel is requested but absent.
     """
-    orography = static["cerra_orography"]
     height_diff = static["cerra_orography"] - static["era5_orography"]
-    return np.stack([
-        (orography - stats["cerra_orography"]["mean"]) / stats["cerra_orography"]["std"],
+    normalise = lambda values, key: (values - stats[key]["mean"]) / stats[key]["std"]
+    stack = [
+        normalise(static["cerra_orography"], "cerra_orography"),
         (height_diff - stats["orography_diff"]["mean"]) / stats["orography_diff"]["std"],
         static["land_sea_mask"],
-        (static["lat"] - stats["lat"]["mean"]) / stats["lat"]["std"],
-        (static["lon"] - stats["lon"]["mean"]) / stats["lon"]["std"],
-    ]).astype("f4")
+        normalise(static["lat"], "lat"),
+        normalise(static["lon"], "lon"),
+    ]
+    if coast_distance:
+        if COAST_CHANNEL not in static:
+            raise KeyError(f"{COAST_CHANNEL} requested but not present in the static fields")
+        stack.append(normalise(static[COAST_CHANNEL], COAST_CHANNEL))
+    return np.stack(stack).astype("f4")
 
 
 def time_features(times) -> np.ndarray:
@@ -349,7 +379,7 @@ class Downscaler:
         self.stats = stats
         self.static = static
         self.device = device
-        self.static_norm = static_stack(static, stats)
+        self.static_norm = static_stack(static, stats, net.cfg.coast_distance)
         self.lat, self.lon = static["lat"], static["lon"]
 
     def save(self, path, extra: dict | None = None) -> None:
@@ -367,7 +397,7 @@ class Downscaler:
             "config": asdict(self.net.cfg),
             "stats": self.stats,
             "static": {k: np.asarray(v) for k, v in self.static.items()},
-            "channels": CHANNELS,
+            "channels": self.net.cfg.channels,
             "extra": extra or {},
         }, path)
 
@@ -385,12 +415,13 @@ class Downscaler:
         """
         device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-        if checkpoint["channels"] != CHANNELS:
-            raise ValueError(
-                f"checkpoint channels {checkpoint['channels']} differ from this code's {CHANNELS}"
-            )
         known = {f.name for f in fields(Config)}
-        net = DownscalerNet(Config(**{k: v for k, v in checkpoint["config"].items() if k in known}))
+        cfg = Config(**{k: v for k, v in checkpoint["config"].items() if k in known})
+        if checkpoint["channels"] != cfg.channels:
+            raise ValueError(
+                f"checkpoint channels {checkpoint['channels']} differ from this code's {cfg.channels}"
+            )
+        net = DownscalerNet(cfg)
         net.load_state_dict(checkpoint["state_dict"])
         return cls(net, checkpoint["stats"], checkpoint["static"], device)
 

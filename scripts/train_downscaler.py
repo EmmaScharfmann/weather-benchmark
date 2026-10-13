@@ -29,7 +29,13 @@ import xarray as xr
 from downscale import downscaler as dsc
 from downscale.config import load_config
 from downscale.constants import elevation_edges
-from downscale.diagnostics import land_mask
+from downscale.constants import COAST_CHANNEL
+from downscale.diagnostics import (
+    distance_to_coast_km,
+    grid_spacing_km,
+    land_mask,
+    maritime_influence,
+)
 
 logger = logging.getLogger("train")
 
@@ -113,8 +119,9 @@ def get_stats(stats_file: Path, coarse_train: np.ndarray, fine_train: np.ndarray
             },
             "orography_diff": {"mean": float(height_diff.mean()), "std": float(height_diff.std())},
         }
-    for key in ("lat", "lon"):
-        stats[key] = {"mean": float(static[key].mean()), "std": float(static[key].std())}
+    for key in ("lat", "lon", COAST_CHANNEL):
+        if key in static:
+            stats[key] = {"mean": float(static[key].mean()), "std": float(static[key].std())}
     return stats
 
 
@@ -334,6 +341,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--max-steps-per-epoch", type=int, default=None)
     parser.add_argument("--upsample", choices=["transpose", "bilinear"], default=None)
     parser.add_argument("--noise-fine-fraction", type=float, default=None)
+    parser.add_argument("--coast-decay-km", type=float, default=None)
+    parser.add_argument(
+        "--no-coast-distance", dest="coast_distance", action="store_false", default=None,
+        help="leave out the distance-to-coast input channel",
+    )
     parser.add_argument(
         "--all-points", dest="land_only", action="store_false", default=None,
         help="train on every grid point instead of land only",
@@ -348,7 +360,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     training = cfg.training
     for name in (
         "loss", "epochs", "batch_size", "learning_rate", "members", "eval_members",
-        "max_steps_per_epoch", "land_only", "upsample", "noise_fine_fraction",
+        "max_steps_per_epoch", "land_only", "upsample", "noise_fine_fraction", "coast_distance", "coast_decay_km",
     ):
         value = getattr(args, name, None)
         if value is not None:
@@ -365,6 +377,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     static = {k: static_ds[k].values.astype("f4") for k in ("cerra_orography", "era5_orography", "land_sea_mask")}
     static["lat"] = static_ds.lat.values.astype("f4")
     static["lon"] = static_ds.lon.values.astype("f4")
+    land = land_mask(static)
+    if land is None:
+        land = np.ones(static["lat"].shape, bool)
+    if training.coast_distance:
+        spacing = grid_spacing_km(static["lat"], static["lon"])
+        distance = distance_to_coast_km(land, spacing)
+        static[COAST_CHANNEL] = maritime_influence(distance, training.coast_decay_km)
+        logger.info(
+            "maritime influence added as an input channel: decay scale %.0f km, "
+            "distances 0 to %.0f km, grid spacing %.2f km",
+            training.coast_decay_km, float(distance.max()), spacing,
+        )
     times = pd.DatetimeIndex(ds.time.values)
     train_mask, val_mask = split_times(times, cfg.val_years, args.val_start, args.val_end)
     started = time.time()
@@ -374,12 +398,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         len(times), train_mask.sum(), val_mask.sum(), coarse.shape[1], coarse.shape[2], time.time() - started,
     )
     stats = get_stats(pairs_dir / "stats.json", coarse[train_mask], fine[train_mask], static)
-    static_norm = dsc.static_stack(static, stats)
+    static_norm = dsc.static_stack(static, stats, training.coast_distance)
     train_idx = np.flatnonzero(train_mask)
     val_coarse, val_fine = coarse[val_mask], fine[val_mask]
     val_times = times[val_mask].to_numpy()
 
-    land = land_mask(static)
     groups = {"land": land}
     edges = elevation_edges(cfg.evaluation.elevation_edges)
     for low, high in zip(edges[:-1], edges[1:]):
@@ -392,7 +415,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         loss=training.loss, base=training.base_channels, depth=training.depth,
         noise_channels=training.noise_channels if training.loss == "crps" else 0,
         upsample=training.upsample, noise_fine_fraction=training.noise_fine_fraction,
-        noise_coarse_factor=training.noise_coarse_factor,
+        noise_coarse_factor=training.noise_coarse_factor, coast_distance=training.coast_distance,
     )
     net = dsc.DownscalerNet(model_cfg).to(device)
     steps_per_epoch = len(train_idx) // training.batch_size
@@ -469,6 +492,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "scored_over": headline,
         "upsample": training.upsample,
         "noise_fine_fraction": training.noise_fine_fraction,
+        "coast_distance": bool(training.coast_distance),
+        "coast_decay_km": training.coast_decay_km,
         "val_period": [str(times[val_mask].min()), str(times[val_mask].max())],
         "best_epoch": torch.load(out / "model.pt", weights_only=False)["extra"]["epoch"],
         "model": model_scores,

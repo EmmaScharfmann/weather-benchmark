@@ -802,6 +802,28 @@ def distance_to_coast_km(mask: np.ndarray, spacing_km: float) -> np.ndarray:
     return distance_transform_edt(mask, sampling=(spacing_km, spacing_km)).astype("f4")
 
 
+def maritime_influence(distance_km: np.ndarray, decay_km: float | None = None) -> np.ndarray:
+    """Turn distance from the coast into a bounded index of maritime influence.
+
+    Distance itself is a poor model input: most of a continental domain lies
+    hundreds of kilometres inland, so after normalisation the first fifty
+    kilometres, where the coastal effect actually varies, occupy a fraction of
+    the channel's range. An exponential decay spends the range where the signal
+    is, giving one at the shoreline and approaching zero inland.
+
+    :param distance_km: Distance to the nearest sea cell [km].
+    :type distance_km: numpy.ndarray
+    :param decay_km: Decay scale; ``None`` uses
+        :data:`~weather_pipeline.constants.COAST_DECAY_KM`.
+    :type decay_km: float | None
+    :returns: Index between zero and one.
+    :rtype: numpy.ndarray
+    """
+    from .constants import COAST_DECAY_KM
+
+    return np.exp(-np.asarray(distance_km, dtype="f8") / (decay_km or COAST_DECAY_KM)).astype("f4")
+
+
 def station_distance_to_coast(
     table: pd.DataFrame, mask: np.ndarray, lat2d: np.ndarray, lon2d: np.ndarray, spacing_km: float
 ) -> np.ndarray:

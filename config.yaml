@@ -18,7 +18,7 @@ paths:
   forecasts: outputs/forecasts  # coarse ensemble forecasts to downscale
   downscaled: outputs/downscaled
   evaluation: outputs/eval
-  stations_cache: outputs/cache/stations202508
+  stations_cache: outputs/cache/stations
 
 target:
   # High-resolution reanalysis used as the training target.
@@ -49,13 +49,13 @@ training:
   loss: crps                    # "crps" for an ensemble, "mse" for a single map
   members: 4                    # members per input during training
   eval_members: 8
-  epochs: 5
+  epochs: 20
   batch_size: 8
   learning_rate: 0.001
   weight_decay: 0.0001
   base_channels: 32
   depth: 3
-  noise_channels: 4
+  noise_channels: 2
   # Decoder upsampling: "bilinear" (interpolate then convolve) avoids the
   # grid-scale checkerboard that "transpose" (strided transposed convolution)
   # produces. Use "transpose" only to reproduce an older run.
@@ -63,7 +63,18 @@ training:
   # Fraction of the noise channels drawn at full resolution. Zero makes every
   # member differ coherently over tens of kilometres rather than pixel by pixel.
   noise_fine_fraction: 0.0
-  noise_coarse_factor: 8        # reduction factor for the coarse noise channels
+  # Reduction factors for the coarse noise channels. A list spreads the
+  # ensemble's variability over several scales; a single value concentrates it
+  # at one, which appears as a peak in the power spectrum at that wavelength.
+  noise_coarse_factor: [8, 16]
+  # Give the model the distance from each point to the nearest sea cell. The
+  # land-sea mask alone is almost binary, so a coastal correction that decays
+  # inland has to be inferred from the mask's edge; this channel supplies it.
+  coast_distance: true
+  # Distance is turned into an exponentially decaying index of maritime
+  # influence, so the channel's range is spent on the first tens of kilometres
+  # rather than on the continental interior.
+  coast_decay_km: 25.0
   seed: 0
   max_steps_per_epoch: null     # cap for quick checks
   # Restrict the loss and the normalisation statistics to land. The sea is still

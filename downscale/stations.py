@@ -1,4 +1,13 @@
-"""Station observations used as independent verification truth."""
+"""Station observations used as independent verification truth.
+
+A provider supplies a station list and long-format values for one network;
+:func:`load_stations` is provider independent and handles caching, quality
+control and the train/holdout split. Supporting a new country means writing one
+class implementing :class:`StationProvider`.
+
+Times are naive UTC, temperatures are in kelvin and station longitudes are
+signed, whereas gridded forecasts use 0..360.
+"""
 
 from __future__ import annotations
 
@@ -73,7 +82,22 @@ class MeteoFranceHourly:
     """
 
     name = "meteofrance_hourly"
-    license = "Etalab Open License 2.0 - Source: Meteo-France"
+    display_name = "Météo-France"
+    license = "Etalab Open Licence 2.0"
+    source_url = "https://meteo.data.gouv.fr/"
+    licence_url = "https://www.etalab.gouv.fr/licence-ouverte-open-licence/"
+    attribution = "Source: Météo-France, données ouvertes, Licence Ouverte / Open Licence 2.0"
+    access_tool = "wetterdienst"
+    access_note = (
+        "Météo-France publishes its observations as per-department CSV archives on "
+        "meteo.data.gouv.fr. They are read here through the wetterdienst library, which "
+        "resolves the station list, downloads the relevant archives and returns tidy values; "
+        "no API key is needed."
+    )
+    dataset_note = (
+        "hourly 'core' observations: instantaneous 2 m air temperature on the hour, "
+        "parameter temperature_air_mean_2m"
+    )
 
     _PARAMS = {
         "t2m": ("hourly", "core", "temperature_air_mean_2m", 273.15),

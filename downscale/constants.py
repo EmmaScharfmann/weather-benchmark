@@ -1,3 +1,9 @@
+"""Fixed values shared across the downscaling pipeline.
+
+Anything a user may want to change per experiment belongs in ``config.yaml``
+instead; this module holds physical constants, schema names and presets.
+"""
+
 from __future__ import annotations
 
 import numpy as np
@@ -47,14 +53,49 @@ ENSEMBLE_METRICS = frozenset({"crps", "ens_mean_rmse", "spread", "ssr"})
 #: Static (time-invariant) model input channels, in input order.
 STATIC_CHANNELS = ["cerra_orography", "orography_diff", "land_sea_mask", "lat", "lon"]
 
+#: Optional static channel measuring how strongly the sea influences each point.
+COAST_CHANNEL = "coast_distance"
+
+#: Decay scale used to turn distance from the coast into a maritime-influence index [km].
+COAST_DECAY_KM = 25.0
+
 #: Time-varying calendar channels, in input order.
 TIME_CHANNELS = ["hour_sin", "hour_cos", "doy_sin", "doy_cos"]
 
 #: Full model input channel order, excluding noise channels.
 CHANNELS = ["era5_t2m", *STATIC_CHANNELS, *TIME_CHANNELS]
 
+
+def channels(coast_distance: bool = False) -> list[str]:
+    """Model input channel order.
+
+    :param coast_distance: Include the distance-to-coast channel.
+    :type coast_distance: bool
+    :returns: Channel names in the order the model expects them.
+    :rtype: list[str]
+    """
+    static = [*STATIC_CHANNELS, COAST_CHANNEL] if coast_distance else list(STATIC_CHANNELS)
+    return ["era5_t2m", *static, *TIME_CHANNELS]
+
 #: Copernicus Climate Data Store dataset identifier for the high-resolution target.
 CERRA_DATASET = "reanalysis-cerra-single-levels"
+
+#: Where each supported target dataset is documented and obtained.
+TARGET_SOURCES = {
+    "reanalysis-cerra-single-levels": {
+        "display_name": "CERRA",
+        "long_name": "Copernicus European Regional ReAnalysis, single levels",
+        "producer": "Copernicus Climate Change Service (C3S), produced by SMHI",
+        "catalogue_url": "https://cds.climate.copernicus.eu/datasets/reanalysis-cerra-single-levels",
+        "api_url": "https://cds.climate.copernicus.eu/api",
+        "licence_url": "https://cds.climate.copernicus.eu/",
+        "native_resolution": "5.5 km on a Lambert conformal grid over Europe",
+        "boundary_note": (
+            "CERRA takes its lateral boundary conditions from the global ERA5 reanalysis, so the two "
+            "are physically consistent, which is what makes them usable as a coarse and fine pair."
+        ),
+    }
+}
 
 #: Margin added around the target grid when cropping the coarse source [degrees].
 COARSE_CROP_MARGIN_DEG = 1.5

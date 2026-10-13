@@ -102,7 +102,9 @@ class TrainingConfig:
     noise_channels: int = 4
     upsample: str = "bilinear"
     noise_fine_fraction: float = 0.0
-    noise_coarse_factor: int = 8
+    noise_coarse_factor: int | list[int] = 8
+    coast_distance: bool = True
+    coast_decay_km: float = 25.0
     seed: int = 0
     max_steps_per_epoch: int | None = None
     land_only: bool = True
