@@ -1169,3 +1169,109 @@ def floor_figure(scores: pd.DataFrame, path, fields: Sequence[str] = ("coarse", 
     ax[0].legend(fontsize=8)
     fig.savefig(path, dpi=120)
     plt.close(fig)
+
+
+def validation_figure(
+    fields: dict[str, np.ndarray], observed: np.ndarray, elevation: np.ndarray,
+    hours: np.ndarray, path, edges: Sequence[float] | None = None, labels: dict | None = None,
+) -> pd.DataFrame:
+    """Four views of how each field performs against station observations.
+
+    The panels answer different questions: where the error sits in terrain, when
+    it sits in the day, how the errors are distributed, and whether the forecast
+    reaches the observed extremes.
+
+    :param fields: Field names mapped to values at stations, shape ``(time, station)``.
+    :type fields: dict[str, numpy.ndarray]
+    :param observed: Observations of the same shape.
+    :type observed: numpy.ndarray
+    :param elevation: Station elevations [m].
+    :type elevation: numpy.ndarray
+    :param hours: UTC hour of each time.
+    :type hours: numpy.ndarray
+    :param path: Destination image.
+    :type path: str | pathlib.Path
+    :param edges: Elevation band edges [m]; ``None`` uses the defaults.
+    :type edges: collections.abc.Sequence[float] | None
+    :param labels: Display names keyed by field.
+    :type labels: dict | None
+    :returns: The scores behind the first two panels.
+    :rtype: pandas.DataFrame
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from .constants import elevation_edges
+
+    names = list(fields)
+    labels = labels or {}
+    colours = {"coarse": "tab:blue", "downscaled": "tab:red", "target": "tab:green"}
+    band_edges = elevation_edges(list(edges) if edges is not None else None)
+    scores = score_against_stations(fields, observed, elevation, hours, band_edges)
+
+    fig, ax = plt.subplots(2, 2, figsize=(13, 9), constrained_layout=True)
+
+    by_elevation = scores[scores.grouping == "elevation"]
+    bands = list(dict.fromkeys(by_elevation.band))
+    positions = np.arange(len(bands))
+    for name in names:
+        chosen = by_elevation[by_elevation.field == name].set_index("band").reindex(bands)
+        ax[0, 0].plot(positions, chosen.rmse_K.values, marker="o",
+                      color=colours.get(name), label=labels.get(name, name))
+        if name == names[-1] and len(names) > 2:
+            ax[0, 0].fill_between(positions, 0, chosen.rmse_K.values,
+                                  color=colours.get(name, "tab:green"), alpha=0.12)
+    ax[0, 0].set_xticks(positions)
+    ax[0, 0].set_xticklabels(bands, fontsize=7, rotation=20)
+    ax[0, 0].set_ylabel("RMSE (K)")
+    ax[0, 0].set_ylim(bottom=0)
+    ax[0, 0].set_title("error by station elevation")
+    ax[0, 0].grid(alpha=0.3)
+    ax[0, 0].legend(fontsize=8)
+
+    by_hour = scores[scores.grouping == "hour"]
+    hour_bands = list(dict.fromkeys(by_hour.band))
+    positions = np.arange(len(hour_bands))
+    for name in names:
+        chosen = by_hour[by_hour.field == name].set_index("band").reindex(hour_bands)
+        ax[0, 1].plot(positions, chosen.rmse_K.values, marker="o", color=colours.get(name),
+                      label=labels.get(name, name))
+        ax[0, 1].plot(positions, chosen.bias_K.values, marker="s", ls="--", color=colours.get(name))
+    ax[0, 1].axhline(0, color="k", lw=0.8)
+    ax[0, 1].set_xticks(positions)
+    ax[0, 1].set_xticklabels(hour_bands, fontsize=8)
+    ax[0, 1].set_ylabel("K")
+    ax[0, 1].set_title("error by time of day (solid: RMSE, dashed: bias)")
+    ax[0, 1].grid(alpha=0.3)
+
+    valid = np.isfinite(observed)
+    for name in names:
+        difference = (fields[name] - observed)[valid & np.isfinite(fields[name])]
+        ax[1, 0].hist(difference, bins=80, range=(-8, 8), histtype="step", linewidth=1.6,
+                      density=True, color=colours.get(name), label=labels.get(name, name))
+    ax[1, 0].axvline(0, color="k", lw=0.8)
+    ax[1, 0].set_xlabel("forecast minus observation (K)")
+    ax[1, 0].set_ylabel("density")
+    ax[1, 0].set_title("distribution of the error")
+    ax[1, 0].grid(alpha=0.3)
+    ax[1, 0].legend(fontsize=8)
+
+    levels = np.array([0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 0.999])
+    observed_quantiles = np.quantile(observed[valid], levels) - 273.15
+    low, high = observed_quantiles.min() - 1, observed_quantiles.max() + 1
+    ax[1, 1].plot([low, high], [low, high], "k--", lw=1)
+    for name in names:
+        usable = valid & np.isfinite(fields[name])
+        ax[1, 1].plot(observed_quantiles, np.quantile(fields[name][usable], levels) - 273.15,
+                      marker="o", ms=4, color=colours.get(name), label=labels.get(name, name))
+    ax[1, 1].set_xlabel("observed quantile (degC)")
+    ax[1, 1].set_ylabel("forecast quantile (degC)")
+    ax[1, 1].set_title("does it reach the observed extremes?")
+    ax[1, 1].grid(alpha=0.3)
+    ax[1, 1].legend(fontsize=8)
+
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+    return scores
