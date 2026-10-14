@@ -33,6 +33,34 @@ class StationUnavailable(Exception):
     """Raised when a station holds no data for the requested period."""
 
 
+def _period_arguments(request_class, start: pd.Timestamp, end: pd.Timestamp) -> dict[str, str]:
+    """Name the period arguments the installed client expects.
+
+    ``wetterdienst`` renamed ``start_date`` and ``end_date`` to ``start`` and
+    ``end``; the installed version decides which pair is accepted.
+
+    :param request_class: Request class whose signature is inspected.
+    :type request_class: type
+    :param start: First time.
+    :type start: pandas.Timestamp
+    :param end: Last time.
+    :type end: pandas.Timestamp
+    :returns: Keyword arguments naming the period.
+    :rtype: dict[str, str]
+    :raises TypeError: If neither pair of names is accepted.
+    """
+    import inspect
+
+    accepted = set(inspect.signature(request_class.__init__).parameters)
+    for first, last in (("start", "end"), ("start_date", "end_date")):
+        if first in accepted and last in accepted:
+            return {first: start.isoformat(), last: end.isoformat()}
+    raise TypeError(
+        f"{request_class.__name__} accepts neither start/end nor start_date/end_date; "
+        f"its arguments are {sorted(accepted)}"
+    )
+
+
 class StationProvider(Protocol):
     """Interface a national observation network must implement."""
 
