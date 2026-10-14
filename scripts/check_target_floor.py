@@ -35,6 +35,7 @@ import xarray as xr
 from downscale.config import load_config
 from downscale.constants import elevation_edges
 from downscale.downscaler import Downscaler
+from downscale.diagnostics import floor_figure, score_against_stations
 from downscale.station_interp import curvilinear_for
 from downscale.stations import MeteoFranceHourly, QCConfig, load_stations
 
@@ -69,92 +70,6 @@ def load_period(pairs_dir: Path, start: pd.Timestamp, end: pd.Timestamp) -> xr.D
     if ds.sizes["time"] == 0:
         raise ValueError(f"the training pairs hold no time between {start} and {end}")
     return ds.load()
-
-
-def score_against_stations(
-    values: dict[str, np.ndarray], observed: np.ndarray, elevation: np.ndarray,
-    hours: np.ndarray, edges: np.ndarray,
-) -> pd.DataFrame:
-    """Score several fields against the observations, overall and by band.
-
-    :param values: Field names mapped to arrays of shape ``(time, station)``.
-    :type values: dict[str, numpy.ndarray]
-    :param observed: Observations of shape ``(time, station)``.
-    :type observed: numpy.ndarray
-    :param elevation: Station elevations [m].
-    :type elevation: numpy.ndarray
-    :param hours: UTC hour of each time.
-    :type hours: numpy.ndarray
-    :param edges: Elevation band edges [m].
-    :type edges: numpy.ndarray
-    :returns: One row per field and grouping with bias, RMSE and the sample count.
-    :rtype: pandas.DataFrame
-    """
-    rows = []
-
-    def add(name: str, grouping: str, band: str, chosen: np.ndarray) -> None:
-        difference = (values[name] - observed)[chosen]
-        difference = difference[np.isfinite(difference)]
-        if difference.size == 0:
-            return
-        rows.append({
-            "field": name, "grouping": grouping, "band": band, "n": int(difference.size),
-            "bias_K": round(float(difference.mean()), 3),
-            "rmse_K": round(float(np.sqrt((difference ** 2).mean())), 3),
-        })
-
-    everything = np.ones_like(observed, bool)
-    for name in values:
-        add(name, "all", "all stations", everything)
-        for low, high in zip(edges[:-1], edges[1:]):
-            band = (elevation >= low) & (elevation < high)
-            add(name, "elevation", f"{int(low)}-{int(high)} m", np.broadcast_to(band, observed.shape))
-        for hour in np.unique(hours):
-            at_hour = (hours == hour)[:, None] & everything
-            add(name, "hour", f"{int(hour):02d} UTC", at_hour)
-    return pd.DataFrame(rows)
-
-
-def floor_figure(scores: pd.DataFrame, path) -> None:
-    """Plot the three fields' error by elevation band and by time of day.
-
-    :param scores: Output of :func:`score_against_stations`.
-    :type scores: pandas.DataFrame
-    :param path: Destination image.
-    :type path: str | pathlib.Path
-    :returns: ``None``
-    :rtype: None
-    """
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    colours = {"coarse": "tab:blue", "downscaled": "tab:red", "target": "tab:green"}
-    fig, ax = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
-    for axis, grouping, title in (
-        (ax[0], "elevation", "RMSE against stations by elevation (K)"),
-        (ax[1], "hour", "RMSE against stations by time of day (K)"),
-    ):
-        subset = scores[scores.grouping == grouping]
-        bands = list(dict.fromkeys(subset.band))
-        positions = np.arange(len(bands))
-        for name in FIELDS:
-            chosen = subset[subset.field == name].set_index("band").reindex(bands)
-            axis.plot(
-                positions, chosen.rmse_K.values, marker="o", color=colours[name], label=LABELS[name]
-            )
-            if name == "target":
-                axis.fill_between(positions, 0, chosen.rmse_K.values, color=colours[name], alpha=0.12)
-        axis.set_xticks(positions)
-        axis.set_xticklabels(bands, fontsize=7, rotation=20)
-        axis.set_title(title)
-        axis.set_ylim(bottom=0)
-        axis.grid(alpha=0.3)
-    ax[0].legend(fontsize=8)
-    ax[0].set_ylabel("RMSE (K)")
-    fig.savefig(path, dpi=120)
-    plt.close(fig)
 
 
 def main(argv: Sequence[str] | None = None, provider=None) -> int:
@@ -221,7 +136,7 @@ def main(argv: Sequence[str] | None = None, provider=None) -> int:
         fields, observed, stations.elevation.values, times.hour.values, edges
     )
     scores.to_csv(out / "floor.csv", index=False)
-    floor_figure(scores, out / "floor.png")
+    floor_figure(scores, out / "floor.png", fields=FIELDS, labels=LABELS)
 
     overall = scores[scores.grouping == "all"].set_index("field")
     summary = {

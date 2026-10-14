@@ -56,6 +56,40 @@ def _table(rows: list[tuple[str, Any]]) -> str:
     return f"| | |\n|---|---|\n{body}"
 
 
+def load_published_target(path_or_repo: str | Path, stream: bool = True, revision: str | None = None):
+    """Open a published reanalysis subset, from the Hub or from a local folder.
+
+    :param path_or_repo: Local folder holding the stores, or a Hub dataset repository id.
+    :type path_or_repo: str | pathlib.Path
+    :param stream: Read lazily over the network rather than downloading the whole repository.
+        Ignored for a local folder.
+    :type stream: bool
+    :param revision: Revision to read when the repository is on the Hub.
+    :type revision: str | None
+    :returns: The time-varying field and the static fields, on the same grid.
+    :rtype: tuple[xarray.Dataset, xarray.Dataset]
+    :raises FileNotFoundError: If a local folder lacks the expected stores.
+    """
+    import xarray as xr
+
+    folder = Path(path_or_repo)
+    if folder.exists():
+        missing = [n for n in ("target.zarr", "static.zarr") if not (folder / n).exists()]
+        if missing:
+            raise FileNotFoundError(f"{folder} does not contain {missing}")
+        root = str(folder)
+    elif stream:
+        root = f"hf://datasets/{path_or_repo}"
+        if revision:
+            root = f"hf://datasets/{path_or_repo}@{revision}"
+    else:
+        from huggingface_hub import snapshot_download
+
+        root = snapshot_download(repo_id=str(path_or_repo), repo_type="dataset", revision=revision)
+    logger.info("reading the target reanalysis from %s", root)
+    return xr.open_zarr(f"{root}/target.zarr"), xr.open_zarr(f"{root}/static.zarr")
+
+
 @dataclass
 class ModelArtefacts:
     """Reports produced for one trained model."""

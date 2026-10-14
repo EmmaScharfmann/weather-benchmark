@@ -940,3 +940,232 @@ def coast_figure(table: pd.DataFrame, distance: np.ndarray, profile: pd.DataFram
     fig.savefig(path, dpi=120)
     plt.close(fig)
     return summary
+
+
+def coast_transect(
+    fields: dict[str, np.ndarray], distance_km: np.ndarray, mask: np.ndarray,
+    edges: Sequence[float] = (0, 5, 10, 15, 20, 30, 40, 60, 80, 120, 200),
+) -> pd.DataFrame:
+    """Average each field across bands of distance from the coast, over time and day by day.
+
+    A model that predicts the conditional mean reproduces the time-averaged
+    profile but not any single day's, because the strength of the land-sea
+    contrast varies. Comparing the two separates a model that has failed to
+    learn the gradient from one that has learned all of it that is predictable.
+
+    :param fields: Labels mapped to arrays of shape ``(time, y, x)``.
+    :type fields: dict[str, numpy.ndarray]
+    :param distance_km: Distance to the nearest sea cell [km].
+    :type distance_km: numpy.ndarray
+    :param mask: Land points to include.
+    :type mask: numpy.ndarray
+    :param edges: Band edges in kilometres.
+    :type edges: collections.abc.Sequence[float]
+    :returns: One row per band with, for each field, the time-mean value and the
+        standard deviation across times of the band average.
+    :rtype: pandas.DataFrame
+    """
+    rows = []
+    for low, high in zip(edges[:-1], edges[1:]):
+        chosen = mask & (distance_km >= low) & (distance_km < high)
+        if not chosen.any():
+            continue
+        row = {"band": f"{low:.0f}-{high:.0f} km", "distance_km": (low + high) / 2,
+               "n_points": int(chosen.sum())}
+        for name, values in fields.items():
+            per_time = values[:, chosen].mean(axis=1)
+            row[f"{name}_mean"] = round(float(per_time.mean()), 3)
+            row[f"{name}_sd_over_time"] = round(float(per_time.std(ddof=1)), 3)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def transect_figure(transect: pd.DataFrame, labels: Sequence[str], path) -> None:
+    """Plot the cross-coast profiles and their day-to-day variability.
+
+    :param transect: Output of :func:`coast_transect`.
+    :type transect: pandas.DataFrame
+    :param labels: Field names to plot.
+    :type labels: collections.abc.Sequence[str]
+    :param path: Destination image.
+    :type path: str | pathlib.Path
+    :returns: ``None``
+    :rtype: None
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(1, 2, figsize=(13, 5), constrained_layout=True)
+    for name in labels:
+        ax[0].plot(transect.distance_km, transect[f"{name}_mean"], marker="o", ms=4, label=name)
+        ax[1].plot(transect.distance_km, transect[f"{name}_sd_over_time"], marker="o", ms=4, label=name)
+    ax[0].set_title("time-mean correction across the coast (K)")
+    ax[1].set_title("day-to-day variability of that correction (K)")
+    for axis in ax:
+        axis.set_xlabel("distance from the coast (km)")
+        axis.grid(alpha=0.3)
+        axis.legend(fontsize=8)
+    ax[0].axhline(0, color="k", lw=0.8)
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+
+
+def comparison_figure(
+    coarse: np.ndarray, downscaled: np.ndarray, target: np.ndarray,
+    lat2d: np.ndarray, lon2d: np.ndarray, path, mask: np.ndarray | None = None,
+    time_label: str = "",
+) -> dict:
+    """Show the coarse, downscaled and target fields with the two error maps.
+
+    The three fields share one colour scale so they can be read against each
+    other; the two error maps share a second, diverging one so the reduction is
+    visible rather than inferred.
+
+    :param coarse: Coarse field on the fine grid [K], shape ``(y, x)``.
+    :type coarse: numpy.ndarray
+    :param downscaled: Downscaled field [K], same shape.
+    :type downscaled: numpy.ndarray
+    :param target: Target field [K], same shape.
+    :type target: numpy.ndarray
+    :param lat2d: Fine-grid latitudes.
+    :type lat2d: numpy.ndarray
+    :param lon2d: Fine-grid longitudes.
+    :type lon2d: numpy.ndarray
+    :param path: Destination image.
+    :type path: str | pathlib.Path
+    :param mask: Land mask; sea points are left blank when given.
+    :type mask: numpy.ndarray | None
+    :param time_label: Text placed above the figure, usually the valid time.
+    :type time_label: str
+    :returns: The root mean squared error of each field against the target.
+    :rtype: dict
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fields = [mask_sea(f, mask) for f in (coarse, downscaled, target)]
+    errors = [fields[0] - fields[2], fields[1] - fields[2]]
+    scores = {
+        "coarse": float(np.sqrt(np.nanmean(errors[0] ** 2))),
+        "downscaled": float(np.sqrt(np.nanmean(errors[1] ** 2))),
+    }
+    low, high = np.nanpercentile(fields[2], [1, 99])
+    limit = float(np.nanpercentile(np.abs(errors[0]), 99))
+
+    fig, ax = plt.subplots(1, 5, figsize=(24, 4.8), constrained_layout=True)
+    titles = ["coarse field", "downscaled", "target"]
+    for axis, field, title in zip(ax[:3], fields, titles):
+        mesh = axis.pcolormesh(lon2d, lat2d, field - 273.15, cmap="RdYlBu_r", vmin=low - 273.15,
+                               vmax=high - 273.15, shading="auto")
+        axis.set_title(title)
+        fig.colorbar(mesh, ax=axis, label="degC")
+    for axis, error, name in zip(ax[3:], errors, ("coarse", "downscaled")):
+        mesh = axis.pcolormesh(lon2d, lat2d, error, cmap="RdBu_r", vmin=-limit, vmax=limit, shading="auto")
+        axis.set_title(f"{name} minus target, RMSE {scores[name]:.2f} K")
+        fig.colorbar(mesh, ax=axis, label="K")
+    mid_lat = float(np.mean(lat2d))
+    for axis in ax:
+        axis.set_aspect(1 / np.cos(np.deg2rad(mid_lat)))
+    if time_label:
+        fig.suptitle(time_label)
+    fig.savefig(path, dpi=100)
+    plt.close(fig)
+    return scores
+
+
+def score_against_stations(
+    values: dict[str, np.ndarray], observed: np.ndarray, elevation: np.ndarray,
+    hours: np.ndarray, edges: Sequence[float],
+) -> pd.DataFrame:
+    """Score several fields against station observations, overall and by band.
+
+    :param values: Field names mapped to arrays of shape ``(time, station)``.
+    :type values: dict[str, numpy.ndarray]
+    :param observed: Observations of shape ``(time, station)``.
+    :type observed: numpy.ndarray
+    :param elevation: Station elevations [m].
+    :type elevation: numpy.ndarray
+    :param hours: UTC hour of each time.
+    :type hours: numpy.ndarray
+    :param edges: Elevation band edges [m].
+    :type edges: collections.abc.Sequence[float]
+    :returns: One row per field and grouping with bias, RMSE and the sample count.
+    :rtype: pandas.DataFrame
+    """
+    rows = []
+
+    def add(name: str, grouping: str, band: str, chosen: np.ndarray) -> None:
+        difference = (values[name] - observed)[chosen]
+        difference = difference[np.isfinite(difference)]
+        if difference.size == 0:
+            return
+        rows.append({
+            "field": name, "grouping": grouping, "band": band, "n": int(difference.size),
+            "bias_K": round(float(difference.mean()), 3),
+            "rmse_K": round(float(np.sqrt((difference ** 2).mean())), 3),
+        })
+
+    everything = np.ones_like(observed, bool)
+    for name in values:
+        add(name, "all", "all stations", everything)
+        for low, high in zip(edges[:-1], edges[1:]):
+            band = (elevation >= low) & (elevation < high)
+            add(name, "elevation", f"{int(low)}-{int(high)} m", np.broadcast_to(band, observed.shape))
+        for hour in np.unique(hours):
+            add(name, "hour", f"{int(hour):02d} UTC", (hours == hour)[:, None] & everything)
+    return pd.DataFrame(rows)
+
+
+def floor_figure(scores: pd.DataFrame, path, fields: Sequence[str] = ("coarse", "downscaled", "target"),
+                 labels: dict | None = None) -> None:
+    """Plot each field's error against stations, with the target shaded as the floor.
+
+    :param scores: Output of :func:`score_against_stations`.
+    :type scores: pandas.DataFrame
+    :param path: Destination image.
+    :type path: str | pathlib.Path
+    :param fields: Field names to plot, the last being the floor.
+    :type fields: collections.abc.Sequence[str]
+    :param labels: Display names keyed by field.
+    :type labels: dict | None
+    :returns: ``None``
+    :rtype: None
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    labels = labels or {
+        "coarse": "coarse field", "downscaled": "coarse field + downscaler",
+        "target": "target reanalysis (the floor)",
+    }
+    colours = {"coarse": "tab:blue", "downscaled": "tab:red", "target": "tab:green"}
+    fig, ax = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
+    for axis, grouping, title in (
+        (ax[0], "elevation", "RMSE against stations by elevation (K)"),
+        (ax[1], "hour", "RMSE against stations by time of day (K)"),
+    ):
+        subset = scores[scores.grouping == grouping]
+        bands = list(dict.fromkeys(subset.band))
+        positions = np.arange(len(bands))
+        for name in fields:
+            chosen = subset[subset.field == name].set_index("band").reindex(bands)
+            axis.plot(positions, chosen.rmse_K.values, marker="o",
+                      color=colours.get(name), label=labels.get(name, name))
+            if name == fields[-1]:
+                axis.fill_between(positions, 0, chosen.rmse_K.values,
+                                  color=colours.get(name, "tab:green"), alpha=0.12)
+        axis.set_xticks(positions)
+        axis.set_xticklabels(bands, fontsize=7, rotation=20)
+        axis.set_title(title)
+        axis.set_ylim(bottom=0)
+        axis.grid(alpha=0.3)
+    ax[0].set_ylabel("RMSE (K)")
+    ax[0].legend(fontsize=8)
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
