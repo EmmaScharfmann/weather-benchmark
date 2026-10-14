@@ -554,6 +554,55 @@ def load_stations(
     return ds, report
 
 
+def load_published_stations(path_or_repo: str | Path, revision: str | None = None) -> xr.Dataset:
+    """Read a published station dataset, local or from the Hugging Face Hub.
+
+    Returns the same object as :func:`load_stations`, so the two are
+    interchangeable: observations over ``(time, station)`` with station
+    coordinates and the holdout flag.
+
+    :param path_or_repo: Local folder holding the Parquet files, or a Hub dataset repository id.
+    :type path_or_repo: str | pathlib.Path
+    :param revision: Revision to download when reading from the Hub.
+    :type revision: str | None
+    :returns: Observations with station metadata.
+    :rtype: xarray.Dataset
+    :raises FileNotFoundError: If the folder lacks the expected Parquet files.
+    """
+    folder = Path(path_or_repo)
+    if not folder.exists():
+        from huggingface_hub import snapshot_download
+
+        folder = Path(snapshot_download(repo_id=str(path_or_repo), repo_type="dataset", revision=revision))
+    missing = [name for name in ("metadata.parquet", "observations.parquet") if not (folder / name).exists()]
+    if missing:
+        raise FileNotFoundError(f"{folder} does not contain {missing}")
+
+    meta = pd.read_parquet(folder / "metadata.parquet")
+    obs = pd.read_parquet(folder / "observations.parquet")
+    obs["station_id"] = obs["station_id"].astype(str)
+    ids = meta["station_id"].astype(str).to_list()
+    variables = [c for c in obs.columns if c not in ("station_id", "time")]
+    hours = pd.date_range(obs["time"].min(), obs["time"].max(), freq="1h")
+    data = {}
+    for variable in variables:
+        wide = obs.pivot_table(index="time", columns="station_id", values=variable, aggfunc="first")
+        data[variable] = (("time", "station"), wide.reindex(index=hours, columns=ids).to_numpy("f4"))
+    ds = xr.Dataset(data, coords={
+        "time": hours.to_numpy().astype("datetime64[ns]"),
+        "station": np.array(ids, dtype=object),
+        "latitude": ("station", meta["latitude"].to_numpy("f8")),
+        "longitude": ("station", meta["longitude"].to_numpy("f8")),
+        "elevation": ("station", meta["elevation_m"].to_numpy("f8")),
+        "name": ("station", meta["name"].astype(str).to_numpy(dtype=object)),
+    })
+    ds["holdout"] = ("station", meta["holdout"].to_numpy(bool))
+    for variable in variables:
+        ds[variable].attrs["units"] = STATION_VARIABLES.get(variable, {}).get("unit", "K")
+    logger.info("loaded %d published station(s) over %s .. %s", len(ids), hours[0], hours[-1])
+    return ds
+
+
 def at_times(ds: xr.Dataset, times: Sequence) -> xr.Dataset:
     """Select observations at given times, filling absent ones with NaN.
 
