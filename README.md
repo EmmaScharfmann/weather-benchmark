@@ -22,9 +22,13 @@ Subscribing creates a repository under your organisation; set `forecasts.source`
 
 ## Tutorial
 
-`tutorial.ipynb` fetches an AIFS-ENS run, applies the published downscaler
+`tutorial_inference.ipynb` fetches an AIFS-ENS run, applies the published downscaler
 ([EmmaScharfmann/france-temperature-downscaler](https://huggingface.co/EmmaScharfmann/france-temperature-downscaler)),
 maps both forecasts, and evaluates them against CERRA, CERRA's own floor and Météo-France stations.
+
+`training_tutorial.ipynb` trains the downscaler from scratch: it pairs ERA5 from Earthmover with CERRA
+from the Hub, trains on 2014 to 2019, scores the model on 2020 against interpolation, and saves a
+checkpoint that `tutorial_inference.ipynb` can load.
 
 ## Pipeline
 
