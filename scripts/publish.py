@@ -60,7 +60,7 @@ def build_model(args, cfg) -> Path:
     :param args: Parsed arguments.
     :type args: argparse.Namespace
     :param cfg: Pipeline configuration.
-    :type cfg: weather_pipeline.config.Config
+    :type cfg: downscale.config.Config
     :returns: The folder written.
     :rtype: pathlib.Path
     """
@@ -97,7 +97,7 @@ def build_dataset(args, cfg) -> Path:
     :param args: Parsed arguments.
     :type args: argparse.Namespace
     :param cfg: Pipeline configuration.
-    :type cfg: weather_pipeline.config.Config
+    :type cfg: downscale.config.Config
     :returns: The folder written.
     :rtype: pathlib.Path
     :raises FileNotFoundError: If the consolidated pairs are missing.
@@ -144,7 +144,7 @@ def build_target(args, cfg) -> Path:
     :param args: Parsed arguments.
     :type args: argparse.Namespace
     :param cfg: Pipeline configuration.
-    :type cfg: weather_pipeline.config.Config
+    :type cfg: downscale.config.Config
     :returns: The folder written.
     :rtype: pathlib.Path
     :raises FileNotFoundError: If the consolidated target is missing.
@@ -210,9 +210,9 @@ def build_stations(args, cfg, provider=None) -> Path:
     :param args: Parsed arguments.
     :type args: argparse.Namespace
     :param cfg: Pipeline configuration.
-    :type cfg: weather_pipeline.config.Config
+    :type cfg: downscale.config.Config
     :param provider: Station provider; ``None`` builds the configured one.
-    :type provider: weather_pipeline.stations.StationProvider | None
+    :type provider: downscale.stations.StationProvider | None
     :returns: The folder written.
     :rtype: pathlib.Path
     """

@@ -41,7 +41,7 @@ def default_bins(
     """Build the binning used to stratify scores.
 
     :param regions: Named sub-regions; ``None`` uses
-        :data:`~weather_pipeline.constants.SCORING_REGIONS`, a falsy value drops region binning.
+        :data:`~downscale.constants.SCORING_REGIONS`, a falsy value drops region binning.
     :type regions: collections.abc.Mapping | None
     :param edges: Elevation band edges [m]; ``None`` uses the defaults.
     :type edges: collections.abc.Sequence[float] | None

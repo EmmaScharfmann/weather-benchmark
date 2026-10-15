@@ -58,6 +58,10 @@ def _covers(manifest: dict | None, start: pd.Timestamp, end: pd.Timestamp) -> bo
     """
     if not manifest:
         return False
+    if "periods" in manifest:
+        return any(
+            pd.Timestamp(p["start"]) <= start and pd.Timestamp(p["end"]) >= end for p in manifest["periods"]
+        )
     if "start" in manifest and "end" in manifest:
         first, last = pd.Timestamp(manifest["start"]), pd.Timestamp(manifest["end"])
     elif "years" in manifest:
@@ -88,8 +92,8 @@ def get_stations(
     :param cache_dir: Where collected observations are cached.
     :type cache_dir: str | pathlib.Path
     :param provider: Station provider; ``None`` uses Météo-France.
-    :type provider: weather_pipeline.stations.StationProvider | None
-    :param kwargs: Passed through to :func:`~weather_pipeline.stations.load_stations`.
+    :type provider: downscale.stations.StationProvider | None
+    :param kwargs: Passed through to :func:`~downscale.stations.load_stations`.
     :returns: Observations over ``(time, station)``, restricted to the period.
     :rtype: xarray.Dataset
     :raises ValueError: If ``source="hub"`` but the published copy cannot serve the period.
@@ -103,8 +107,7 @@ def get_stations(
     if repo is not None and source in (AUTO, HUB):
         if _covers(_manifest(repo), start, end):
             logger.info("reading stations for %s .. %s from %s", start, end, repo)
-            published = load_published_stations(repo)
-            return published.sel(time=slice(start, end))
+            return load_published_stations(repo, start=start, end=end)
         if source == HUB:
             raise ValueError(f"{repo} does not cover {start} .. {end}; use source='auto' to collect them")
         logger.info("%s does not cover %s .. %s; collecting from the network instead", repo, start, end)
@@ -117,7 +120,7 @@ def get_stations(
 
 def get_target(
     start, end, repo: str | Path | None = None, source: str = AUTO, local: str | Path = "data/cerra",
-    stream: bool = True, **kwargs,
+    stream: bool = True, load: bool = False, retries: int = 3, **kwargs,
 ) -> tuple[xr.Dataset, xr.Dataset]:
     """Reanalysis fields for a period, from a published copy or a local download.
 
@@ -134,7 +137,13 @@ def get_target(
     :type local: str | pathlib.Path
     :param stream: Read the published copy lazily rather than downloading it whole.
     :type stream: bool
-    :param kwargs: Passed through to :func:`~weather_pipeline.publish.load_published_target`.
+    :param load: Read the period into memory before returning. Streaming reads chunks on demand,
+        so a long computation makes many requests and any one can time out; loading makes them
+        all at once, retried on network errors.
+    :type load: bool
+    :param retries: Attempts at loading before giving up, when ``load`` is set.
+    :type retries: int
+    :param kwargs: Passed through to :func:`~downscale.publish.load_published_target`.
     :returns: The time-varying field restricted to the period, and the static fields.
     :rtype: tuple[xarray.Dataset, xarray.Dataset]
     :raises ValueError: If ``source="hub"`` but the published copy cannot serve the period.
@@ -147,7 +156,8 @@ def get_target(
         if _covers(_manifest(repo), start, end):
             logger.info("reading the reanalysis for %s .. %s from %s", start, end, repo)
             target, static = load_published_target(repo, stream=stream, **kwargs)
-            return target.sel(time=slice(start, end)), static
+            target = target.sel(time=slice(start, end))
+            return (load_with_retries(target, retries), load_with_retries(static, retries)) if load else (target, static)
         if source == HUB:
             raise ValueError(f"{repo} does not cover {start} .. {end}; download those dates instead")
         logger.info("%s does not cover %s .. %s; reading the local download instead", repo, start, end)
@@ -160,3 +170,30 @@ def get_target(
         )
     target, static = load_published_target(folder)
     return target.sel(time=slice(start, end)), static
+
+
+def load_with_retries(ds, retries: int = 5):
+    """Read a lazily opened dataset into memory, retrying network errors.
+
+    :param ds: Dataset or data array to load.
+    :type ds: xarray.Dataset | xarray.DataArray
+    :param retries: Attempts before giving up.
+    :type retries: int
+    :returns: The loaded object.
+    :rtype: xarray.Dataset | xarray.DataArray
+    """
+    import time
+
+    transient = ("Timeout", "Connect", "Proxy", "RemoteProtocol", "Network", "ReadError", "StorageError")
+    for attempt in range(1, retries + 1):
+        try:
+            return ds.load()
+        except Exception as exc:  # noqa: BLE001
+            # Network errors come from several libraries (httpx, aiohttp, icechunk), so match them by name.
+            names = [type(e).__name__ for e in (exc, exc.__cause__, exc.__context__) if e is not None]
+            if not isinstance(exc, (OSError, TimeoutError)) and not any(t in n for t in transient for n in names):
+                raise
+            error = exc
+        logger.warning("loading failed (%s), attempt %d of %d", type(error).__name__, attempt, retries)
+        time.sleep(10 * attempt)
+    raise error

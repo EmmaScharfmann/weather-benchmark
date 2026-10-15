@@ -5,7 +5,7 @@
 # region or period, copy this file and edit it; no code changes are needed.
 
 region:
-  # A preset name from weather_pipeline.constants.REGION_PRESETS, or null.
+  # A preset name from downscale.constants.REGION_PRESETS, or null.
   name: france
   # Explicit bounding box [lat_min, lat_max, lon_min, lon_max], lon in -180..180.
   # Overrides `name` when set. Must cover the target grid plus a margin.
@@ -15,7 +15,7 @@ paths:
   target: data/cerra            # downloaded high-resolution target
   pairs: data/pairs             # coarse/fine training pairs
   runs: runs                    # trained models and reports
-  forecasts: outputs/forecasts  # coarse ensemble forecasts to downscale
+  forecasts: outputs/forecasts  # AIFS-ENS forecasts fetched by fetch_forecasts.py
   downscaled: outputs/downscaled
   evaluation: outputs/eval
   stations_cache: outputs/cache/stations
@@ -31,10 +31,22 @@ target:
   cds_workers: 2                # concurrent Copernicus requests; keep small
 
 coarse:
-  # Coarse source providing the model input during training.
+  # Coarse source providing the model input during training: ERA5 from Earthmover.
   source: era5
   variable: t2m
   fetch_batch: 28               # time steps per request
+
+forecasts:
+  # AIFS Ensemble 1.0 forecasts to downscale, fetched by scripts/fetch_forecasts.py.
+  # An Arraylake repository: subscribe to the dataset on the Earthmover marketplace
+  # (https://app.earthmover.io/marketplace/6a10729e8a69e6bcaeae0f90) and put the
+  # name of the repository it creates here. A Zarr store with the same layout,
+  # local or on the Hub (hf://datasets/owner/name), works too.
+  source: emmahf/ecmwf-aifs-ens-forecast-subscription
+  variable: t2m
+  members: 10                   # first members kept; null keeps all 51
+  max_lead_hours: 240           # null keeps all 360 hours
+  init_hours: [0, 12]           # initialisations kept between --start and --end
 
 stations:
   provider: meteofrance_hourly

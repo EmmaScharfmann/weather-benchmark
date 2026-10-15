@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import build_pairs  # noqa: E402
 import download_cerra  # noqa: E402
 import eval_downscaled  # noqa: E402
+import fetch_forecasts  # noqa: E402
 from conftest import coarse_terrain, diurnal, terrain  # noqa: E402
 from downscale.config import load_config  # noqa: E402
 
@@ -24,10 +25,10 @@ def torch_modules():
     :returns: The ``downscale_forecasts`` module and the downscaler module.
     :rtype: tuple[types.ModuleType, types.ModuleType]
     """
-    pytest.importorskip("torch", reason="torch is installed with requirements/downscaler.txt")
+    pytest.importorskip("torch", reason="torch is not installed")
     import downscale_forecasts
 
-    from weather_pipeline import downscaler
+    from downscale import downscaler
 
     return downscale_forecasts, downscaler
 
@@ -211,7 +212,7 @@ def test_pairs_consolidation_computes_statistics(
 @pytest.fixture
 def trained_model(tmp_path, static_fields, stats):
     """An untrained network saved as a checkpoint, enough to exercise inference."""
-    torch = pytest.importorskip("torch", reason="torch is installed with requirements/downscaler.txt")
+    torch = pytest.importorskip("torch", reason="torch is not installed")
     _, dsc = torch_modules()
     torch.manual_seed(0)
     net = dsc.DownscalerNet(dsc.Config(loss="crps", base=8, depth=3, noise_channels=4))
@@ -241,6 +242,32 @@ def test_downscaling_produces_an_ensemble_on_the_fine_grid(
     expected = (300 - 0.0065 * terrain(static_fields["lat"], static_fields["lon"])) + diurnal(6)
     assert np.abs(result.t2m_interp.isel(time=0, lead_time=0, ensemble=0).values - expected).mean() < 0.5
     assert (Path(config.paths.downscaled) / "map_check.png").exists()
+
+
+def test_fetched_aifs_ens_forecasts_can_be_downscaled(config, config_path, trained_model, static_fields, tmp_path):
+    from test_sources import earthmover_archive
+
+    downscale_forecasts, _ = torch_modules()
+    inits = pd.date_range("2025-08-01", periods=4, freq="6h")
+    archive = earthmover_archive(inits, ingested=[np.timedelta64(36, "h")] * 4).rename(
+        {"init_time": "time", "ensemble_member": "ensemble", "latitude": "lat", "longitude": "lon"}
+    )
+    out = tmp_path / "forecasts"
+    args = ["--config", str(config_path), "--start", "2025-08-01", "--end", "2025-08-01", "--out", str(out),
+            "--members", "2", "--max-lead-hours", "12"]
+    assert fetch_forecasts.main(args, archive=archive) == 0
+    stores = sorted(out.glob("*.zarr"))
+    assert [p.name for p in stores] == ["aifs-ens_20250801T0000.zarr", "aifs-ens_20250801T1200.zarr"]
+    assert fetch_forecasts.main(args, archive=archive) == 0
+
+    status = downscale_forecasts.main([
+        "--config", str(config_path), "--model", str(trained_model), "--forecasts", str(stores[0]),
+        "--out", config.paths.downscaled, "--samples", "2", "--device", "cpu",
+    ])
+    assert status == 0
+    result = xr.open_zarr(Path(config.paths.downscaled) / stores[0].name)
+    assert result.t2m_ds.shape == (1, 3, 2, 2, *static_fields["lat"].shape)
+    assert float(result.t2m_interp.mean()) == pytest.approx(273.15 + 15, abs=1)
 
 
 def test_downscaling_refuses_an_unfinished_forecast(config, config_path, forecast_store, trained_model):

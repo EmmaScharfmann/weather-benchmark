@@ -262,7 +262,7 @@ def consolidate(cfg: Config, out: Path) -> dict:
     untouched.
 
     :param cfg: Pipeline configuration.
-    :type cfg: weather_pipeline.config.Config
+    :type cfg: downscale.config.Config
     :param out: Output directory.
     :type out: pathlib.Path
     :returns: Normalisation statistics and sanity checks, also written to ``stats.json``.
@@ -406,14 +406,14 @@ def main(argv: Sequence[str] | None = None, source=None, geopotential=None) -> i
         return 0
 
     static = xr.open_zarr(target_dir / "static.zarr")
-    if source is None:
-        from weather_pipeline.datasource import build_data_source
+    if source is None or geopotential is None:
+        if cfg.coarse.source != "era5":
+            raise ValueError(f"coarse.source {cfg.coarse.source!r} is not supported; only 'era5' is")
+        from downscale.sources import ERA5
 
-        source = build_data_source(cfg.coarse.source)
-    if geopotential is None:
-        from weather_pipeline.statics import load_statics
-
-        geopotential = load_statics(source)["z"]
+        era5 = ERA5()
+        source = source or era5
+        geopotential = geopotential if geopotential is not None else era5.surface_geopotential()
     coarse = CoarseOnTargetGrid(
         source, static.lat.values, static.lon.values, cfg.coarse.variable,
         batch=args.batch or cfg.coarse.fetch_batch,
