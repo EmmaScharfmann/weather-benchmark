@@ -1,4 +1,0 @@
-# Layered on the base project env:  uv run --with-requirements requirements/downscaler.txt python scripts/train_downscaler.py ...
-# Use the SAME torch line as your AIFS requirements file, so the CUDA build matches your GPUs
-# (e.g. copy it from requirements/<aifs file>.txt). A bare "torch" may resolve a CPU or mismatched build.
-torch==2.5.0

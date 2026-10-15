@@ -11,6 +11,9 @@ import numpy as np
 #: Standard gravity, used to convert geopotential to height [m s^-2].
 G = 9.80665
 
+#: Offset between kelvin and degrees Celsius.
+ZERO_C = 273.15
+
 #: Standard atmosphere temperature lapse rate [K m^-1].
 STD_LAPSE = 6.5e-3
 

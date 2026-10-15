@@ -407,13 +407,15 @@ class Downscaler:
 
         :param path: Checkpoint file.
         :type path: str | pathlib.Path
-        :param device: Torch device; ``None`` selects CUDA when available.
+        :param device: Torch device; ``None`` selects CUDA, then Apple's MPS, when available.
         :type device: str | None
         :returns: Model ready for inference.
         :rtype: Downscaler
         :raises ValueError: If the checkpoint's channel order differs from this code's.
         """
-        device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        if device is None:
+            mps = getattr(torch.backends, "mps", None)
+            device = "cuda" if torch.cuda.is_available() else "mps" if mps and mps.is_available() else "cpu"
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         known = {f.name for f in fields(Config)}
         cfg = Config(**{k: v for k, v in checkpoint["config"].items() if k in known})

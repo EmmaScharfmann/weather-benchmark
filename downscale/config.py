@@ -74,6 +74,17 @@ class CoarseConfig:
 
 
 @dataclass
+class ForecastsConfig:
+    """AIFS-ENS forecasts to downscale."""
+
+    source: str = "emmahf/ecmwf-aifs-ens-forecast-subscription"
+    variable: str = "t2m"
+    members: int | None = 10
+    max_lead_hours: int | None = 240
+    init_hours: list[int] = field(default_factory=lambda: [0, 12])
+
+
+@dataclass
 class StationsConfig:
     """Observation network used as independent truth."""
 
@@ -138,6 +149,7 @@ class Config:
     paths: PathsConfig = field(default_factory=PathsConfig)
     target: TargetConfig = field(default_factory=TargetConfig)
     coarse: CoarseConfig = field(default_factory=CoarseConfig)
+    forecasts: ForecastsConfig = field(default_factory=ForecastsConfig)
     stations: StationsConfig = field(default_factory=StationsConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)

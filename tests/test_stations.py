@@ -188,3 +188,81 @@ def test_custom_quality_thresholds_are_applied(provider, tmp_path):
         qc=QCConfig(min_completeness=0.3),
     )
     assert "D" in ds.station.values
+
+def published_two_periods(folder):
+    """Write a published station set covering two separate months."""
+    import json
+
+    meta = pd.DataFrame({
+        "station_id": ["a", "b", "c"], "name": ["A", "B", "C"], "latitude": [45.0, 46.0, 47.0],
+        "longitude": [1.0, 2.0, 3.0], "elevation_m": [10.0, 200.0, 900.0], "holdout": [False, True, False],
+    })
+    first = pd.date_range("2020-08-01", "2020-08-31", freq="1h")
+    second = pd.date_range("2025-08-01", "2025-08-31", freq="1h")
+    rows = [pd.DataFrame({"station_id": s, "time": t, "t2m": 290.0}) for s, t in
+            (("a", first), ("b", first), ("b", second), ("c", second))]
+    folder.mkdir()
+    meta.to_parquet(folder / "metadata.parquet", index=False)
+    pd.concat(rows).to_parquet(folder / "observations.parquet", index=False)
+    (folder / "manifest.json").write_text(json.dumps({
+        "start": "2020-08-01 00:00:00", "end": "2025-08-31 00:00:00",
+        "periods": [{"start": "2020-08-01 00:00:00", "end": "2020-08-31 00:00:00"},
+                    {"start": "2025-08-01 00:00:00", "end": "2025-08-31 00:00:00"}],
+    }))
+    return folder
+
+
+def test_one_period_of_a_merged_set_holds_only_its_hours_and_stations(tmp_path):
+    from downscale.stations import load_published_stations
+
+    folder = published_two_periods(tmp_path / "stations")
+    august_2025 = load_published_stations(folder, start="2025-08-01", end="2025-08-31")
+    assert list(august_2025.station.values) == ["b", "c"]
+    assert august_2025.sizes["time"] == 721
+    everything = load_published_stations(folder)
+    assert everything.sizes["time"] == 2 * 721 and everything.sizes["station"] == 3
+    with pytest.raises(ValueError, match="no observation"):
+        load_published_stations(folder, start="2022-01-01", end="2022-01-31")
+
+
+def test_a_merged_set_covers_each_period_but_not_the_gap(tmp_path):
+    from downscale.fetch import _covers, _manifest
+
+    manifest = _manifest(published_two_periods(tmp_path / "stations"))
+    assert _covers(manifest, pd.Timestamp("2025-08-03"), pd.Timestamp("2025-08-20"))
+    assert not _covers(manifest, pd.Timestamp("2022-08-03"), pd.Timestamp("2022-08-20"))
+    assert not _covers(manifest, pd.Timestamp("2020-08-30"), pd.Timestamp("2025-08-02"))
+
+
+def test_loading_retries_a_timeout_and_then_gives_up():
+    from downscale import fetch
+
+    class Flaky:
+        calls = 0
+
+        def load(self):
+            Flaky.calls += 1
+            if Flaky.calls < 2:
+                raise TimeoutError("read timed out")
+            return "loaded"
+
+    import time
+    sleep, time.sleep = time.sleep, lambda s: None
+    try:
+        assert fetch.load_with_retries(Flaky(), 3) == "loaded"
+
+        class Broken:
+            def load(self):
+                raise TimeoutError("down")
+
+        with pytest.raises(TimeoutError):
+            fetch.load_with_retries(Broken(), 2)
+
+        class Wrong:
+            def load(self):
+                raise KeyError("not a network error")
+
+        with pytest.raises(KeyError):
+            fetch.load_with_retries(Wrong(), 3)
+    finally:
+        time.sleep = sleep

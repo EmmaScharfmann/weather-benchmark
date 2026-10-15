@@ -814,7 +814,7 @@ def maritime_influence(distance_km: np.ndarray, decay_km: float | None = None) -
     :param distance_km: Distance to the nearest sea cell [km].
     :type distance_km: numpy.ndarray
     :param decay_km: Decay scale; ``None`` uses
-        :data:`~weather_pipeline.constants.COAST_DECAY_KM`.
+        :data:`~downscale.constants.COAST_DECAY_KM`.
     :type decay_km: float | None
     :returns: Index between zero and one.
     :rtype: numpy.ndarray

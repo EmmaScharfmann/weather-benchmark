@@ -78,7 +78,7 @@ def main(argv: Sequence[str] | None = None, provider=None) -> int:
     :param argv: Argument list; ``None`` reads ``sys.argv``.
     :type argv: collections.abc.Sequence[str] | None
     :param provider: Station provider; ``None`` builds the configured one.
-    :type provider: weather_pipeline.stations.StationProvider | None
+    :type provider: downscale.stations.StationProvider | None
     :returns: Exit status.
     :rtype: int
     """

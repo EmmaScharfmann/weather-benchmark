@@ -167,8 +167,7 @@ class MeteoFranceHourly:
         disable = self.cache_disable if cache_disable is None else cache_disable
         return MeteoFranceObservationRequest(
             parameters=[self._PARAMS[v][:3] for v in variables],
-            start_date=start.isoformat(),
-            end_date=end.isoformat(),
+            **_period_arguments(MeteoFranceObservationRequest, start, end),
             settings=Settings(cache_disable=disable),
         )
 
@@ -487,7 +486,7 @@ def load_stations(
     :rtype: tuple[xarray.Dataset, pandas.DataFrame]
     :raises ValueError: If the timestamps are timezone aware, the primary variable is not
         requested, or ``active`` is not one of the two allowed values.
-    :raises KeyError: If a variable is not in :data:`~weather_pipeline.constants.STATION_VARIABLES`.
+    :raises KeyError: If a variable is not in :data:`~downscale.constants.STATION_VARIABLES`.
     """
     qc = qc or QCConfig()
     region = parse_region(region)
@@ -582,7 +581,9 @@ def load_stations(
     return ds, report
 
 
-def load_published_stations(path_or_repo: str | Path, revision: str | None = None) -> xr.Dataset:
+def load_published_stations(
+    path_or_repo: str | Path, revision: str | None = None, start=None, end=None,
+) -> xr.Dataset:
     """Read a published station dataset, local or from the Hugging Face Hub.
 
     Returns the same object as :func:`load_stations`, so the two are
@@ -593,7 +594,13 @@ def load_published_stations(path_or_repo: str | Path, revision: str | None = Non
     :type path_or_repo: str | pathlib.Path
     :param revision: Revision to download when reading from the Hub.
     :type revision: str | None
-    :returns: Observations with station metadata.
+    :param start: First time to keep; ``None`` keeps everything from the start. A dataset can cover
+        several separate periods, so selecting one keeps the result small.
+    :type start: str | pandas.Timestamp | None
+    :param end: Last time to keep; a date alone includes that whole day.
+    :type end: str | pandas.Timestamp | None
+    :returns: Observations over the hours present in the window, for the stations that report in it,
+        with station metadata.
     :rtype: xarray.Dataset
     :raises FileNotFoundError: If the folder lacks the expected Parquet files.
     """
@@ -609,9 +616,20 @@ def load_published_stations(path_or_repo: str | Path, revision: str | None = Non
     meta = pd.read_parquet(folder / "metadata.parquet")
     obs = pd.read_parquet(folder / "observations.parquet")
     obs["station_id"] = obs["station_id"].astype(str)
+    if start is not None:
+        obs = obs[obs["time"] >= pd.Timestamp(start)]
+    if end is not None:
+        last = pd.Timestamp(end)
+        if isinstance(end, str) and len(end.strip()) <= len("YYYY-MM-DD"):
+            last = last + pd.Timedelta(hours=23, minutes=59)
+        obs = obs[obs["time"] <= last]
+    if obs.empty:
+        raise ValueError(f"{path_or_repo} has no observation between {start} and {end}")
+    meta = meta[meta["station_id"].astype(str).isin(set(obs["station_id"]))]
     ids = meta["station_id"].astype(str).to_list()
     variables = [c for c in obs.columns if c not in ("station_id", "time")]
-    hours = pd.date_range(obs["time"].min(), obs["time"].max(), freq="1h")
+    # Only the hours present: a merged dataset spans separate periods, and the gaps hold nothing.
+    hours = pd.DatetimeIndex(np.sort(obs["time"].unique()))
     data = {}
     for variable in variables:
         wide = obs.pivot_table(index="time", columns="station_id", values=variable, aggfunc="first")

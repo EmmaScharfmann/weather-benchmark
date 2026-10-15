@@ -255,7 +255,7 @@ different plausible fields that together form an ensemble.
 ## Usage
 
 ```python
-from weather_pipeline.downscaler import Downscaler
+from downscale.downscaler import Downscaler
 
 model = Downscaler.load("model.pt")
 fine = model.predict(coarse_kelvin, valid_times, members=4)

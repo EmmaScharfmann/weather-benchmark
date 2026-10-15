@@ -261,7 +261,7 @@ def do_static(cfg: Config, out: Path, client=None, opener: Callable = open_grib)
     """Download and crop the time-invariant fields.
 
     :param cfg: Pipeline configuration.
-    :type cfg: weather_pipeline.config.Config
+    :type cfg: downscale.config.Config
     :param out: Output directory.
     :type out: pathlib.Path
     :param client: Climate Data Store client; ``None`` builds one.
@@ -316,7 +316,7 @@ def do_month(
     """Download, crop and check one month.
 
     :param cfg: Pipeline configuration.
-    :type cfg: weather_pipeline.config.Config
+    :type cfg: downscale.config.Config
     :param out: Output directory.
     :type out: pathlib.Path
     :param year: Calendar year.
@@ -365,7 +365,7 @@ def consolidate(cfg: Config, out: Path) -> Path:
     """Merge the downloaded months into a single store.
 
     :param cfg: Pipeline configuration.
-    :type cfg: weather_pipeline.config.Config
+    :type cfg: downscale.config.Config
     :param out: Output directory.
     :type out: pathlib.Path
     :returns: Path to the consolidated store.

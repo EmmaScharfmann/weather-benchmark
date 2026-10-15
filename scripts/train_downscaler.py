@@ -194,7 +194,7 @@ def validate(
     """Score the model and plain interpolation over the validation period.
 
     :param net: Network to evaluate.
-    :type net: weather_pipeline.downscaler.DownscalerNet
+    :type net: downscale.downscaler.DownscalerNet
     :param coarse: Coarse validation fields [K].
     :type coarse: numpy.ndarray
     :param fine: Target validation fields [K].
@@ -258,7 +258,7 @@ def figures(out: Path, history: list[dict], model: dsc.Downscaler, coarse, fine,
     :param history: Per-epoch records.
     :type history: list[dict]
     :param model: Best model, used for the map.
-    :type model: weather_pipeline.downscaler.Downscaler
+    :type model: downscale.downscaler.Downscaler
     :param coarse: Coarse validation fields [K].
     :type coarse: numpy.ndarray
     :param fine: Target validation fields [K].

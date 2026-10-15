@@ -12,7 +12,6 @@ processed are skipped unless the forecast has gained members since.
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import logging
 import shutil
 import sys
@@ -25,47 +24,11 @@ import pandas as pd
 import xarray as xr
 
 from downscale.config import load_config
-from downscale.constants import MAX_FRACTION_OUTSIDE
 from downscale.diagnostics import land_mask, mask_sea, sea_report
 from downscale.downscaler import Downscaler
-from downscale.station_interp import GridInterpolator
+from downscale.inference import downscale_forecast
 
 logger = logging.getLogger("downscale")
-
-
-def to_fine_grid(forecast: xr.DataArray, lat2d: np.ndarray, lon2d: np.ndarray) -> np.ndarray:
-    """Interpolate a forecast onto the fine grid.
-
-    A rotated fine grid can have corners slightly outside the forecast domain;
-    a small fraction is allowed and takes edge values.
-
-    :param forecast: Forecast over ``(time, lead_time, ensemble, lat, lon)``.
-    :type forecast: xarray.DataArray
-    :param lat2d: Fine grid latitudes with shape ``(y, x)``.
-    :type lat2d: numpy.ndarray
-    :param lon2d: Fine grid longitudes with shape ``(y, x)``.
-    :type lon2d: numpy.ndarray
-    :returns: Values over ``(time, lead_time, ensemble, y, x)``.
-    :rtype: numpy.ndarray
-    :raises ValueError: If too much of the fine grid lies outside the forecast domain.
-    """
-    interp = GridInterpolator.build(
-        forecast["lat"].values, forecast["lon"].values, lat2d.ravel(), lon2d.ravel()
-    )
-    fraction_outside = 1 - interp.inside.mean()
-    if fraction_outside > MAX_FRACTION_OUTSIDE:
-        raise ValueError(
-            f"{fraction_outside:.1%} of the fine grid lies outside the forecast domain: "
-            "the forecast region is too small"
-        )
-    if fraction_outside > 0:
-        logger.warning(
-            "%.2f%% of fine grid points lie outside the forecast domain and take edge values",
-            100 * fraction_outside,
-        )
-        interp = dataclasses.replace(interp, inside=np.ones_like(interp.inside))
-    out = interp.apply(forecast)
-    return out.values.reshape(*out.shape[:-1], *lat2d.shape)
 
 
 def downscale_init(
@@ -76,7 +39,7 @@ def downscale_init(
     :param forecast_path: Forecast store for a single initialisation.
     :type forecast_path: pathlib.Path
     :param model: Trained downscaler.
-    :type model: weather_pipeline.downscaler.Downscaler
+    :type model: downscale.downscaler.Downscaler
     :param out_dir: Output directory.
     :type out_dir: pathlib.Path
     :param variable: Variable to downscale.
@@ -107,47 +70,11 @@ def downscale_init(
         )
         shutil.rmtree(target)
 
-    forecast = ds[variable]
-    if "ensemble" not in forecast.dims:
-        forecast = forecast.expand_dims(ensemble=[0])
-    forecast = forecast.transpose("time", "lead_time", "ensemble", "lat", "lon").load()
     started = time.time()
-    coarse = to_fine_grid(forecast, model.lat, model.lon).astype("f4")
-    valid = forecast["time"].values[:, None] + forecast["lead_time"].values[None, :]
-    n_init, n_lead, n_ensemble = coarse.shape[:3]
-    n_samples = samples if model.net.cfg.stochastic else 1
-    fine = np.empty((n_init, n_lead, n_ensemble, n_samples, *model.lat.shape), "f4")
-    for i in range(n_init):
-        for member in range(n_ensemble):
-            fine[i, :, member] = model.predict(coarse[i, :, member], valid[i], members=samples, batch=batch)
-
-    result = xr.Dataset(
-        {
-            "t2m_interp": (("time", "lead_time", "ensemble", "y", "x"), coarse),
-            "t2m_ds": (("time", "lead_time", "ensemble", "sample", "y", "x"), fine),
-            "land_sea_mask": (("y", "x"), model.static["land_sea_mask"].astype("f4")),
-            "orography": (("y", "x"), model.static["cerra_orography"].astype("f4")),
-        },
-        coords={
-            "time": forecast["time"].values,
-            "lead_time": forecast["lead_time"].values,
-            "ensemble": forecast["ensemble"].values,
-            "sample": np.arange(n_samples),
-            "lat": (("y", "x"), model.lat),
-            "lon": (("y", "x"), model.lon),
-            "valid_time": (("time", "lead_time"), valid),
-        },
-    )
-    for name in ("t2m_interp", "t2m_ds"):
-        result[name].attrs["units"] = "K"
-    result["orography"].attrs["units"] = "m"
-    result["land_sea_mask"].attrs["long_name"] = "land fraction of the fine grid cell"
-    result.attrs = {
-        "forecast": str(forecast_path),
-        "model": str(model.net.cfg),
-        "init_time": str(pd.Timestamp(forecast["time"].values[0])),
-        "note": "t2m_ds holds, for each coarse member, several plausible fine-scale maps",
-    }
+    result = downscale_forecast(model, ds[variable], samples, batch)
+    result.attrs["forecast"] = str(forecast_path)
+    coarse, fine = result["t2m_interp"].values, result["t2m_ds"].values
+    n_lead, n_ensemble, n_samples = coarse.shape[1], coarse.shape[2], fine.shape[3]
     result = result.chunk({"lead_time": 10, "ensemble": 1, "sample": -1, "y": -1, "x": -1})
     for name in ("land_sea_mask", "orography"):
         result[name] = result[name].chunk({"y": -1, "x": -1})

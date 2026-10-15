@@ -333,7 +333,7 @@ def run(cfg, forecast_paths, downscaled_paths, out_dir, provider=None) -> dict:
     """Score both forecasts and write the tables and figures.
 
     :param cfg: Pipeline configuration.
-    :type cfg: weather_pipeline.config.Config
+    :type cfg: downscale.config.Config
     :param forecast_paths: Coarse forecast stores.
     :type forecast_paths: collections.abc.Sequence[str]
     :param downscaled_paths: Matching downscaled stores.
@@ -341,7 +341,7 @@ def run(cfg, forecast_paths, downscaled_paths, out_dir, provider=None) -> dict:
     :param out_dir: Output directory.
     :type out_dir: str | pathlib.Path
     :param provider: Station provider; ``None`` builds the configured one.
-    :type provider: weather_pipeline.stations.StationProvider | None
+    :type provider: downscale.stations.StationProvider | None
     :returns: Summary of the comparison, also written to ``summary.json``.
     :rtype: dict
     :raises FileNotFoundError: If a forecast has no matching downscaled store.

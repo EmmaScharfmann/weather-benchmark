@@ -1,41 +1,34 @@
 [project]
-name = "weather-pipeline"
+name = "weather-forecast-model-downscaler"
 version = "0.1.0"
-description = "Open benchmark harness for Earth2Studio weather models"
+description = "Train a downscaler on ERA5/CERRA and apply it to AIFS-ENS forecasts from Earthmover"
 requires-python = ">=3.12"
-# Deliberately model-agnostic: numpy/xarray/plotting/data-access only.
-# torch + earth2studio[<model>] + any model-specific packages (anemoi,
-# aurora, ...) live in requirements/<model>.txt instead, layered on top of
-# this base per-model via `uv run --with-requirements`. That split is the
-# whole point -- it's what lets aurora's torch pin and aifs's torch pin
-# never have to coexist in the same resolved environment.
 dependencies = [
     "numpy",
     "pandas",
     "xarray",
     "zarr",
+    "scipy",
+    "dask",
+    "pyyaml",
+    "torch",
+    # Coarse inputs: ERA5 for training and AIFS-ENS forecasts, both read from Earthmover.
     "arraylake",
-    "pcodec",  # zarr codec the Arraylake ERA5 repo is compressed with -- needed
-    # anywhere that repo is read: base env AND every model env, since
-    # each model's isolated env re-fetches its own initial conditions
-    "matplotlib",
-    "cartopy",
-    "imageio[ffmpeg]",
-    # Scoring. Not published to PyPI, so it comes from git via
-    # [tool.uv.sources] below. Pulls in apache-beam and its dependency
-    # tree, which is heavy but base-env only -- the model environments
-    # never import it, since they only run forecasts.
-    "weatherbenchX",
-    "ipykernel",
-    "wetterdienst",
+    "pcodec",  # zarr codec the Arraylake ERA5 repo is compressed with
+    # Published datasets and models on the Hugging Face Hub (fsspec "hf://" paths included).
+    "huggingface_hub",
+    # Station observations from Météo-France.
+    "wetterdienst==0.141.0",  # later releases rename the parameters downscale/stations.py requests
+    # Target download from the Copernicus Climate Data Store; GRIB decoding needs ecCodes.
     "cdsapi",
     "cfgrib",
     "eccodes>=2.38",
     "eccodeslib",
-    "pyyaml",   
-    "scipy",    
-    "dask",
-    "huggingface_hub"
+    # Station scoring. Not published to PyPI, so it comes from git via [tool.uv.sources].
+    "weatherbenchX",
+    "matplotlib",
+    "cartopy",
+    "ipykernel",
 ]
 
 [build-system]
@@ -43,28 +36,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["downscale", "weather_pipeline"]
-
-[tool.uv]
-# find-links only ever adds candidate wheels for packages that actually
-# appear on that page (natten), so it doesn't compete with PyPI for
-# anything else -- safe to leave as a blanket setting.
-find-links = ["https://whl.natten.org"]
-
-# The pytorch wheel index is NOT safe to add as a blanket extra-index-url:
-# it also mirrors common packages (certifi, importlib-metadata, ...), and
-# since uv resolves each package from the first index that has a match,
-# it was winning those packages with stale versions and breaking
-# nvidia-physicsnemo's real requirements. `explicit = true` + pinning it
-# in [tool.uv.sources] means ONLY torch is ever resolved from here --
-# everything else still comes from PyPI.
-[[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
-explicit = true
+packages = ["downscale"]
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu130" }
 weatherbenchX = { git = "https://github.com/google-research/weatherbenchX.git" }
 
 [dependency-groups]
